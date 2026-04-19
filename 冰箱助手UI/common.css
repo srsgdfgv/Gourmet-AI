@@ -1,0 +1,373 @@
+:root{
+  --bg:#f4f7fb; --panel:#ffffff; --accent:#2f8de6; --accent-dark:#176fbf;
+  --muted:#6e7b86; --user-bg:#e6f0ff; --success:#2a9d8f; --danger:#e63946;
+  font-family: "Noto Sans SC","Microsoft YaHei", Roboto, Arial, sans-serif;
+}
+
+/* 禁用选择（保留触摸响应） */
+*{ -webkit-user-select:none; -moz-user-select:none; -ms-user-select:none; user-select:none; box-sizing:border-box; }
+
+html,body{
+  height:100%;
+  margin:0;
+  background:linear-gradient(180deg,#eef4fb,#f6f9ff);
+  -webkit-tap-highlight-color: transparent;
+  /* 不再全局禁止手势，改为保守的 pan-y，让垂直滚动更自然 */
+  touch-action: auto;
+  overflow:hidden;
+}
+
+.layout{display:flex;height:100vh;}
+.sidebar{width:200px;background:linear-gradient(180deg,#1a3a5f,#2a5a8f);display:flex;flex-direction:column;align-items:center;padding:20px 12px;gap:12px;color:#fff;}
+
+/* 加大侧边栏所有字体的大小 */
+.sidebar {
+  font-size: 16px; /* 增加基准字体大小 */
+}
+
+.brand{width:70px;height:70px;border-radius:14px;background:linear-gradient(135deg,#4a90e2,#63b8ff);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:26px;}
+.brand-text .brand-title{margin:0;font-size:16px;color:#fff;font-weight:600}
+.menu{width:100%;margin-top:6px;display:flex;flex-direction:column;gap:8px;}
+.menu .menu-item{display:flex;align-items:center;gap:10px;padding:12px;border-radius:10px;border:0;background:transparent;color:white;cursor:pointer;font-weight:600; touch-action: manipulation;font-size:16px;}
+.menu .menu-item.active{background:rgba(255,255,255,0.08);transform:translateX(4px);}
+.menu .icon{width:44px;height:44px;border-radius:10px;background:rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center;font-size:20px;}
+.footer-text{font-size:12px;color:rgba(255,255,255,0.7);margin-top:8px;text-align:center}
+
+/* main */
+.main{flex:1;display:flex;flex-direction:column;padding:14px;min-width:0}
+.main-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.main-title h1{margin:0;font-size:20px;color:#10314a} .main-title p{margin:0;font-size:13px;color:var(--muted)}
+.fullscreen-btn{background:linear-gradient(135deg,var(--accent),var(--accent-dark));border:0;padding:8px 12px;border-radius:8px;color:#fff;cursor:pointer}
+
+/* views */
+.view{display:flex;flex-direction:column;flex:1;min-height:0}
+.messages{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:12px;border-radius:10px;background:linear-gradient(180deg,rgba(255,255,255,0.02),transparent);-webkit-overflow-scrolling:touch; touch-action: pan-y; overscroll-behavior: contain;}
+.content{overflow:auto; -webkit-overflow-scrolling:touch; touch-action: pan-y; overscroll-behavior: contain;}
+.msg{max-width:82%;padding:12px 14px;border-radius:12px;font-size:16px;line-height:1.4;box-shadow:0 8px 20px rgba(16,24,40,0.04)}
+.msg.assistant{align-self:flex-start;background:var(--panel);color:#0f1720}
+.msg.user{align-self:flex-end;background:var(--user-bg);color:#05325a}
+
+/* Ensure interactive controls preserve normal tap/click behavior */
+.menu button, .menu .menu-item, .mic-btn, .btn, a, button, input, textarea, select { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+
+/* status & mic */
+.statusBar{margin-top:8px;padding:10px;border-radius:8px;background:rgba(255,255,255,0.6);color:var(--muted)}
+.mic-btn{position:fixed;right:84px;bottom:14px;width:64px;height:64px;border-radius:999px;background:linear-gradient(180deg,var(--accent),var(--accent-dark));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;box-shadow:0 18px 40px rgba(47,141,230,0.22);z-index:60;cursor:pointer; touch-action: manipulation;}
+.mic-btn.off{background:linear-gradient(180deg,#cfd8e3,#e7eefc);color:#5f7890;box-shadow:none}
+.mic-btn.recording{animation:micPulse 1s infinite}
+@keyframes micPulse{0%{transform:scale(1)}50%{transform:scale(1.06)}100%{transform:scale(1)}}
+
+/* mic 弹窗（靠近 mic） */
+.mic-bubble{
+  position:fixed;        /* JS 会覆盖 left/top，使用 fixed 方便定位 */
+  display:none;
+  background:var(--panel);
+  padding:10px 12px;
+  border-radius:10px;
+  box-shadow:0 14px 40px rgba(16,24,40,0.12);
+  color:#0f1720;
+  font-size:14px;
+  z-index:9999;
+  max-width:320px;
+  white-space:normal;
+  opacity:1;
+  transition:opacity 160ms ease;
+}
+
+/* responsive fallback */
+@media (max-width:720px){
+  .mic-bubble{ max-width:200px; font-size:13px; }
+}
+/* modal */
+.modal-backdrop{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;z-index:120}
+.modal{width:640px;max-width:92vw;background:var(--panel);border-radius:12px;box-shadow:0 24px 60px rgba(16,24,40,0.36);overflow:hidden;display:flex;flex-direction:column}
+.modal header{display:flex;justify-content:space-between;padding:12px;border-bottom:1px solid rgba(0,0,0,0.05)}
+.modal .content{padding:12px;max-height:60vh;overflow:auto}
+.controls{display:flex;justify-content:space-between;align-items:center;padding:12px;border-top:1px solid rgba(0,0,0,0.05)}
+.btn{background:var(--accent);color:white;padding:8px 12px;border-radius:8px;border:0;cursor:pointer}
+.btn.ghost{background:transparent;color:var(--muted);border:1px solid rgba(0,0,0,0.05)}
+
+/* inventory list cards */
+#inventory_content ul{list-style:none;padding:0;margin:0;display:flex;flex-wrap:wrap;gap:12px}
+.ingredient-card{background:var(--panel);border-radius:10px;padding:12px;min-width:180px;box-shadow:0 8px 20px rgba(16,24,40,0.04);display:flex;gap:6px}
+.ingredient-card .meta{color:var(--muted);font-size:13px}
+.ingredient-card .expiry {font-weight:700;color:var(--danger)}
+
+/* recipes cards */
+#recipes_content{display:flex;flex-direction:column;gap:12px}
+.recipe-card{background:var(--panel);padding:12px;border-radius:10px;display:flex;flex-direction:row;gap:12px;align-items:flex-start;box-shadow:0 8px 20px rgba(16,24,40,0.03)}
+.recipe-card .thumb{width:72px;height:72px;border-radius:8px;background:linear-gradient(135deg,#f3f6fb,#eef6ff);display:flex;align-items:center;justify-content:center;color:var(--muted);font-weight:700}
+.recipe-card .body{flex:1}
+.recipe-card .title{font-weight:700;margin-bottom:6px}
+.recipe-card .desc{color:var(--muted);font-size:14px}
+
+/* cooking */
+#cooking_panel { max-width:840px; padding-top: 8px; }
+#cooking_steps li { margin-bottom:10px; line-height:1.6; }
+
+/* 删除页面中的重复标题 */
+#inventory h2, #recipes h2, #cooking h2, #settings h2 {
+  display: none;
+}
+
+/* 调整页面填充，因为没有页面标题了 */
+#inventory, #recipes, #cooking, #settings {
+  padding-top: 20px;
+}
+
+/* responsive */
+@media (max-width:720px){
+  .sidebar{
+    width:60px;
+    padding:10px;
+    font-size: 12px; /* 移动端适当调整 */
+  }
+
+  .brand-text .brand-title {
+    font-size: 10px; /* 移动端适当调整 */
+  }
+
+  .menu .menu-item {
+    font-size: 12px; /* 移动端适当调整 */
+  }
+
+  .menu .icon {
+    width:38px;
+    height:38px;
+    font-size: 16px; /* 移动端图标字体 */
+  }
+
+  .mic-btn{right:20px;bottom:20px;width:52px;height:52px}
+  .mic-bubble{right:86px; bottom:20px; max-width:200px}
+}
+
+/* 库存界面新样式 */
+.ingredient-card {
+  transition: all 0.2s ease;
+  cursor: pointer;
+}
+
+.ingredient-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 16px rgba(0,0,0,0.12) !important;
+}
+
+/* 食物种类颜色 */
+.category-vegetable {
+  background: rgba(46, 204, 113, 0.05) !important;
+  border-left: 4px solid #2ecc71 !important;
+}
+
+.category-meat {
+  background: rgba(231, 76, 60, 0.05) !important;
+  border-left: 4px solid #e74c3c !important;
+}
+
+.category-dairy {
+  background: rgba(243, 156, 18, 0.05) !important;
+  border-left: 4px solid #f39c12 !important;
+}
+
+.category-other {
+  background: var(--panel) !important;
+  border-left: 4px solid var(--muted) !important;
+}
+
+/* 统计卡片样式 */
+.stats-card {
+  transition: transform 0.3s ease;
+}
+
+.stats-card:hover {
+  transform: scale(1.05);
+}
+
+/* 保质期状态 */
+.expiry-good {
+  background: rgba(46, 204, 113, 0.15) !important;
+  color: #2ecc71 !important;
+}
+
+.expiry-warning {
+  background: rgba(243, 156, 18, 0.15) !important;
+  color: #f39c12 !important;
+}
+
+.expiry-expired {
+  background: rgba(230, 57, 70, 0.15) !important;
+  color: #e63946 !important;
+}
+
+/* 响应式调整 */
+@media (max-width: 720px) {
+  #inventoryGrid {
+    grid-template-columns: 1fr !important;
+  }
+
+  .ingredient-card {
+    flex-direction: column;
+  }
+
+  .ingredient-card > div:last-child {
+    border-left: none !important;
+    border-top: 1px solid rgba(0,0,0,0.08);
+    padding-left: 0 !important;
+    padding-top: 8px;
+    margin-top: 8px;
+  }
+
+  .ingredient-card > div:first-child > div:last-child {
+    flex-wrap: wrap;
+  }
+
+  .ingredient-card > div:first-child > div:last-child button {
+    flex: 1 0 40%;
+    margin-bottom: 4px;
+  }
+}
+
+/* 自定义悬浮窗样式 */
+#customModal {
+  animation: modalFadeIn 0.2s ease;
+}
+
+@keyframes modalFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 悬浮窗内容区域的滚动条 */
+#customModal > div > div:nth-child(2)::-webkit-scrollbar {
+  width: 6px;
+}
+
+#customModal > div > div:nth-child(2)::-webkit-scrollbar-track {
+  background: rgba(0,0,0,0.05);
+  border-radius: 3px;
+}
+
+#customModal > div > div:nth-child(2)::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,0.2);
+  border-radius: 3px;
+}
+
+#customModal > div > div:nth-child(2)::-webkit-scrollbar-thumb:hover {
+  background: rgba(0,0,0,0.3);
+}
+
+/* 悬浮窗内的表单元素 */
+#customModal input,
+#customModal select,
+#customModal textarea {
+  font-family: inherit;
+}
+
+#customModal input:focus,
+#customModal select:focus,
+#customModal textarea:focus {
+  outline: none;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 2px rgba(47, 141, 230, 0.2);
+}
+
+/* 设置页面选项卡样式 */
+.settings-tab-btn {
+    background: transparent;
+    border: none;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--muted);
+    cursor: pointer;
+    border-radius: 8px;
+    transition: all 0.2s ease;
+}
+
+.settings-tab-btn.active {
+    background: var(--accent);
+    color: white;
+}
+
+.settings-tab-btn:hover:not(.active) {
+    background: rgba(47, 141, 230, 0.1);
+    color: var(--accent);
+}
+
+/* 历史记录卡片 */
+.history-card {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 12px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+    transition: all 0.2s ease;
+}
+
+.history-card:hover {
+    transform: translateX(2px);
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.history-card.user {
+    border-left: 4px solid var(--accent);
+}
+
+.history-card.assistant {
+    border-left: 4px solid var(--success);
+}
+
+.history-card.system {
+    border-left: 4px solid var(--muted);
+}
+
+.history-time {
+    font-size: 11px;
+    color: var(--muted);
+    margin-bottom: 6px;
+}
+
+.history-role {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+.history-content {
+    font-size: 14px;
+    line-height: 1.5;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+/* 统计卡片 */
+.stat-card {
+    background: var(--panel);
+    border-radius: 12px;
+    padding: 16px;
+    text-align: center;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.04);
+}
+
+.stat-number {
+    font-size: 32px;
+    font-weight: 800;
+    color: var(--accent);
+    line-height: 1;
+}
+
+.stat-label {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 6px;
+}
+
+.category-badge {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 20px;
+    font-size: 12px;
+    background: rgba(0, 0, 0, 0.05);
+}
