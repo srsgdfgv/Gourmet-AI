@@ -43,18 +43,21 @@ DEEPSEEK_API_BASE = "https://api.deepseek.com"
 
 MIC_DEVICE = "plughw:2,0"
 CALIBRATION_DURATION = 1.0
-# 背景噪声之上再加若干 dB 才算「有声」；调高可减少风扇/环境声误判，过小环境下若拾音弱可适当调回
-THRESHOLD_OFFSET = 12
+# 背景噪声之上再加若干 dB 才算「有声」；与 SPEECH_ACTIVATION 搭配，厨房吵可略调高，正常环境拾音弱可略调低
+THRESHOLD_OFFSET = 10
 INITIAL_WAIT_SEC = 12
-POST_SPEECH_WAIT_SEC = 1
+# 须连续低于「深静默线」这么久才结束
+POST_SPEECH_WAIT_SEC = 1.2
 CHUNK_DURATION = 0.08
-VOICE_DEBOUNCE = 10
+VOICE_DEBOUNCE = 9
 # 整段录音上限（须大于 INITIAL_WAIT_SEC）；超时多为环境一直嘈杂、无法出现「说完后的静默」
 MAX_RECORD_DURATION = 28
 DB_SMOOTH_WIN = 8
-MIN_THRESHOLD = 12
-# 开口判定 = silence_threshold + 本值；须明显高于背景判定线，减少炒菜/油烟机/剁菜等持续中等噪声误判为「在说话」
-SPEECH_ACTIVATION_MARGIN_DB = 8
+MIN_THRESHOLD = 10
+# 开口判定 = silence_threshold + 本值；厨房误触可提到 10，一般环境 6～8
+SPEECH_ACTIVATION_MARGIN_DB = 7
+# 句尾须明显低于判定线（dB）才计静默；过大则永远等不到句尾、拾音弱时更难结束
+SILENCE_END_MARGIN_DB = 4
 PLAYBACK_INTERRUPT_MARGIN_DB = 4
 PLAYBACK_INTERRUPT_DEBOUNCE = 3
 MIN_VALID_AUDIO_BYTES = 6000
@@ -283,8 +286,9 @@ class SpeechRecognizer:
                 "arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", "16000", "-c", "1", "-q"
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
+            deep_q = silence_threshold - SILENCE_END_MARGIN_DB
             print(
-                f"🎤 正在监听...（低于≤{silence_threshold:.1f}dB 计静默，开口须≥{voice_activation_threshold:.1f}dB）"
+                f"🎤 正在监听...（开口≥{voice_activation_threshold:.1f}dB；句尾须<{deep_q:.1f}dB 持续{POST_SPEECH_WAIT_SEC}s）"
             )
 
             while True:
@@ -353,7 +357,11 @@ class SpeechRecognizer:
                         last_speech_time = time.time()
                         print(f"\n✅ 检测到说话（分贝：{mean_db:.1f}），开始录音...")
                 else:
+                    deep_quiet_ceiling = silence_threshold - SILENCE_END_MARGIN_DB
                     if mean_db >= silence_threshold:
+                        last_speech_time = time.time()
+                    elif mean_db >= deep_quiet_ceiling:
+                        # 介于深静默与「有声」之间：炒菜、油锅声常见，视为仍在嘈杂环境，刷新计时，避免误触发句尾
                         last_speech_time = time.time()
                     elif last_speech_time and (time.time() - last_speech_time) >= POST_SPEECH_WAIT_SEC:
                         print(f"\n✅ 说话后{POST_SPEECH_WAIT_SEC}秒静默，结束录音")
