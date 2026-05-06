@@ -43,14 +43,23 @@ DEEPSEEK_API_BASE = "https://api.deepseek.com"
 
 MIC_DEVICE = "plughw:2,0"
 CALIBRATION_DURATION = 1.0
-THRESHOLD_OFFSET = 3
+# 背景噪声之上再加若干 dB 才算「有声」；调高可减少风扇/环境声误判，过小环境下若拾音弱可适当调回
+THRESHOLD_OFFSET = 12
 INITIAL_WAIT_SEC = 12
-POST_SPEECH_WAIT_SEC = 2
+POST_SPEECH_WAIT_SEC = 1
 CHUNK_DURATION = 0.08
-VOICE_DEBOUNCE = 5
-MAX_RECORD_DURATION = 12
-DB_SMOOTH_WIN = 5
-MIN_THRESHOLD = 3
+VOICE_DEBOUNCE = 10
+# 整段录音上限（须大于 INITIAL_WAIT_SEC）；超时多为环境一直嘈杂、无法出现「说完后的静默」
+MAX_RECORD_DURATION = 28
+DB_SMOOTH_WIN = 8
+MIN_THRESHOLD = 12
+# 开口判定 = silence_threshold + 本值；须明显高于背景判定线，减少炒菜/油烟机/剁菜等持续中等噪声误判为「在说话」
+SPEECH_ACTIVATION_MARGIN_DB = 8
+PLAYBACK_INTERRUPT_MARGIN_DB = 4
+PLAYBACK_INTERRUPT_DEBOUNCE = 3
+MIN_VALID_AUDIO_BYTES = 6000
+# 百度语音合成 volume：0–15，15 最大
+BAIDU_TTS_VOL_MAX = 15
 
 # 自动执行置信度阈值（0.0 - 1.0）
 AUTO_EXECUTE_CONFIDENCE_THRESHOLD = 0.75
@@ -116,12 +125,16 @@ class SpeechRecognizer:
         self.playback_lock = threading.Lock()
         # 新增：音频监听停止事件（用于播放时的分贝检测）
         self._monitor_stop_event = threading.Event()
+        # 新增：TTS 任务忙碌标记（包含合成 + 播放），用于强制“播完再录”
+        self._tts_busy_event = threading.Event()
 
     # 新增：播放时监听音频分贝的方法
     def _monitor_audio_during_playback(self, silence_threshold):
         """播放音频时后台监听麦克风，分贝超过阈值则停止播放"""
         chunk_bytes = int(16000 * 2 * CHUNK_DURATION)
         db_window = deque(maxlen=DB_SMOOTH_WIN)
+        interrupt_threshold = silence_threshold + PLAYBACK_INTERRUPT_MARGIN_DB
+        interrupt_counter = 0
         try:
             proc = subprocess.Popen([
                 "arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", "16000", "-c", "1", "-q"
@@ -137,8 +150,12 @@ class SpeechRecognizer:
                 db_window.append(raw_db)
                 mean_db = round(float(np.mean(db_window)), 2) if db_window else 0.0
 
-                # 分贝超过阈值，停止播放
-                if mean_db >= silence_threshold:
+                # 播放时使用更高阈值 + 连续触发防抖，降低误停概率
+                if mean_db >= interrupt_threshold:
+                    interrupt_counter += 1
+                else:
+                    interrupt_counter = 0
+                if interrupt_counter >= PLAYBACK_INTERRUPT_DEBOUNCE:
                     print(f"\n🔊 检测到说话（分贝：{mean_db:.1f}），停止当前语音播放")
                     self.stop_playback()
                     break
@@ -184,16 +201,23 @@ class SpeechRecognizer:
             except Exception:
                 return False
 
+    def is_tts_busy(self) -> bool:
+        """返回 TTS 是否忙碌（合成中或播放中）。"""
+        return self._tts_busy_event.is_set() or self.is_playing()
+
     def calculate_db(self, audio_data: bytes) -> float:
         try:
             if len(audio_data) < 100:
                 return 0.0
-            samples = np.frombuffer(audio_data, dtype=np.int16)
-            valid_samples = samples[(np.abs(samples) <= 32767)]
-            if len(valid_samples) == 0:
+            # 先转 float，避免 int16 平方溢出导致 sqrt 产生 NaN
+            samples = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+            if samples.size == 0:
                 return 0.0
-            rms = np.sqrt(np.mean(np.square(valid_samples)))
-            if rms < 1e-6:
+            mean_square = float(np.mean(np.square(samples)))
+            if (not np.isfinite(mean_square)) or mean_square <= 0.0:
+                return 0.0
+            rms = float(np.sqrt(mean_square))
+            if (not np.isfinite(rms)) or rms < 1e-6:
                 return 0.0
             db = 20 * np.log10(rms / 32767) + 100
             db = max(0.0, min(100.0, db))
@@ -226,6 +250,9 @@ class SpeechRecognizer:
             return MIN_THRESHOLD + THRESHOLD_OFFSET
 
     def record_audio_adaptive(self) -> bool:
+        # Clear any stale stop request before starting a fresh recorded session.
+        self.clear_stop()
+
         temp_file = tempfile.NamedTemporaryFile(suffix=".pcm", delete=False)
         temp_filename = temp_file.name
         temp_file.close()
@@ -233,6 +260,7 @@ class SpeechRecognizer:
 
         silence_threshold = self.calibrate_background_noise()
         silence_threshold = max(silence_threshold, MIN_THRESHOLD)
+        voice_activation_threshold = silence_threshold + SPEECH_ACTIVATION_MARGIN_DB
 
         chunk_bytes = int(16000 * 2 * CHUNK_DURATION)
         audio_file = open(temp_filename, "wb")
@@ -240,20 +268,47 @@ class SpeechRecognizer:
         start_time = time.time()
         last_speech_time = None
         is_voice_active = False
+        stopped_by_request = False
+        stopped_by_max_duration = False
         activation_counter = 0
+        playback_interrupt_counter = 0
         db_window = deque(maxlen=DB_SMOOTH_WIN)
+        # 打断播报也要求达到「像开口」的能量，避免厨房环境声误停 TTS
+        playback_interrupt_threshold = silence_threshold + max(
+            PLAYBACK_INTERRUPT_MARGIN_DB, SPEECH_ACTIVATION_MARGIN_DB
+        )
 
         try:
             proc = subprocess.Popen([
                 "arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", "16000", "-c", "1", "-q"
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-            print(f"🎤 正在监听...（阈值：{silence_threshold:.1f}dB）")
+            print(
+                f"🎤 正在监听...（低于≤{silence_threshold:.1f}dB 计静默，开口须≥{voice_activation_threshold:.1f}dB）"
+            )
 
             while True:
+                if self.is_stop_requested():
+                    print("\n🛑 录音被停止请求")
+                    stopped_by_request = True
+                    break
+
                 total_elapsed = time.time() - start_time
+
+                # 尚未检测到开口时，优先按「等待超时」结束，避免与最大录音时长分支冲突、误报「已达最大时长」
+                if not is_voice_active and total_elapsed >= INITIAL_WAIT_SEC:
+                    print(f"\n⏰ {INITIAL_WAIT_SEC}秒内无有效说话，停止监听")
+                    audio_file.close()
+                    if os.path.exists(temp_filename):
+                        os.unlink(temp_filename)
+                    if proc.poll() is None:
+                        proc.terminate()
+                        proc.wait()
+                    return False
+
                 if total_elapsed >= MAX_RECORD_DURATION:
                     print(f"\n⏰ 已达最大录音时长（{MAX_RECORD_DURATION}秒），停止录音")
+                    stopped_by_max_duration = True
                     break
 
                 audio_chunk = proc.stdout.read(chunk_bytes)
@@ -268,9 +323,12 @@ class SpeechRecognizer:
 
                 # 如果在录音过程中检测到分贝超过阈值，立即停止当前播放（确保即时响应）
                 try:
-                    if mean_db >= silence_threshold:
-                        # 在每次检测到“有人说话”的时候，确保停止当前正在播放的 TTS
-                        if self.is_playing():
+                    if mean_db >= playback_interrupt_threshold:
+                        playback_interrupt_counter += 1
+                    else:
+                        playback_interrupt_counter = 0
+                    # 在每次检测到“有人说话”的时候，确保停止当前正在播放的 TTS
+                    if playback_interrupt_counter >= PLAYBACK_INTERRUPT_DEBOUNCE and self.is_playing():
                             print(f"\n🔊 在录音中检测到说话（分贝：{mean_db:.1f}），立即停止播放")
                             try:
                                 # 终止播放器进程
@@ -286,7 +344,7 @@ class SpeechRecognizer:
                     pass
 
                 if not is_voice_active:
-                    if mean_db >= silence_threshold:
+                    if mean_db >= voice_activation_threshold:
                         activation_counter += 1
                     else:
                         activation_counter = 0
@@ -294,15 +352,6 @@ class SpeechRecognizer:
                         is_voice_active = True
                         last_speech_time = time.time()
                         print(f"\n✅ 检测到说话（分贝：{mean_db:.1f}），开始录音...")
-                    elif int(total_elapsed) >= INITIAL_WAIT_SEC:
-                        print(f"\n⏰ {INITIAL_WAIT_SEC}秒内无有效说话，停止监听")
-                        audio_file.close()
-                        if os.path.exists(temp_filename):
-                            os.unlink(temp_filename)
-                        if proc.poll() is None:
-                            proc.terminate()
-                            proc.wait()
-                        return False
                 else:
                     if mean_db >= silence_threshold:
                         last_speech_time = time.time()
@@ -331,9 +380,26 @@ class SpeechRecognizer:
                 pass
             audio_file.close()
 
+        if stopped_by_max_duration:
+            print(
+                "\n⚠️ 长时间未检测到「说完后的静默」（常见于炒菜、油烟机等持续嘈杂），已丢弃本次录音，避免误识别。"
+            )
+            if os.path.exists(temp_filename):
+                try:
+                    os.unlink(temp_filename)
+                except Exception:
+                    pass
+            self.temp_audio_file = None
+            return False
+
+        if stopped_by_request and (not is_voice_active):
+            if os.path.exists(temp_filename):
+                os.unlink(temp_filename)
+            return False
+
         if os.path.exists(temp_filename):
             size = os.path.getsize(temp_filename)
-            if size < 1000:
+            if size < MIN_VALID_AUDIO_BYTES:
                 print("⚠️ 录音文件过小，无有效音频")
                 os.unlink(temp_filename)
                 return False
@@ -392,6 +458,9 @@ class SpeechRecognizer:
             return None
 
     def listen_and_recognize(self) -> Optional[str]:
+        while self.is_tts_busy():
+            # 强制等待播报完整结束后再录音，避免并发抢占导致误录
+            time.sleep(0.05)
         if not self.record_audio_adaptive():
             return None
         text = None
@@ -406,7 +475,7 @@ class SpeechRecognizer:
         return text
 
     # 新增：TTS合成与播放相关方法
-    def synthesize_speech(self, text: str, out_path: str, per: int = 0, vol: int = 20, spd: int = 8, pit: int = 7) -> bool:
+    def synthesize_speech(self, text: str, out_path: str, per: int = 0, vol: int = BAIDU_TTS_VOL_MAX, spd: int = 8, pit: int = 7) -> bool:
         token = self.get_access_token()
         if not token:
             print("❌ 无法合成语音：缺少 token")
@@ -533,10 +602,13 @@ class SpeechRecognizer:
                     pass
                 return False
 
-    def speak_async_worker(self, text: str, per: int = 0, vol: int = 15, spd: int = 8, pit: int = 7):
+    def speak_async_worker(self, text: str, per: int = 0, vol: int = BAIDU_TTS_VOL_MAX, spd: int = 8, pit: int = 7):
         temp_mp3_path = None
         try:
+            self._tts_busy_event.set()
             self.stop_playback()
+            # TTS 不再通过 request_stop 影响录音线程，避免产生短录音误识别。
+            self.clear_stop()
             temp_mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
             temp_mp3_path = temp_mp3.name
             temp_mp3.close()
@@ -547,7 +619,6 @@ class SpeechRecognizer:
                     os.unlink(temp_mp3_path)
                 return
 
-            self.request_stop()
             self.play_audio(temp_mp3_path)
         except Exception as e:
             print(f"❌ 后台TTS线程出错: {e}")
@@ -557,8 +628,10 @@ class SpeechRecognizer:
                     os.unlink(temp_mp3_path)
             except:
                 pass
+            self._tts_busy_event.clear()
+            self.clear_stop()  # 播报结束后清除停止请求
 
-    def speak(self, text: str, per: int = 0, vol: int = 15, spd: int = 8, pit: int = 7):
+    def speak(self, text: str, per: int = 0, vol: int = BAIDU_TTS_VOL_MAX, spd: int = 8, pit: int = 7):
         if not text or not text.strip():
             return
         try:
@@ -753,10 +826,6 @@ class AIService:
             "    - 严禁回应任何厨房无关话题：天气、新闻、娱乐、科技、游戏、社交八卦、健康医疗（非饮食相关）、生活琐事等，所有无关提问一律**礼貌引导回厨房主题**或**明确拒绝**；\n"
             "    - 示例：用户问「今天天气怎么样」→ 回复「抱歉，我是厨房助手，专注于帮你处理食材、菜谱相关的问题哦~」；用户问「推荐一部电影」→ 回复「我的职责是帮你解决厨房相关需求，比如食材管理、菜谱推荐，有这方面的问题可以随时找我」。\n"
             "2.  **意图识别与回复规则（执行标准）**\n"
-            "    - **数据操作意图**：用户明确要求对食材、偏好、菜谱、保质期、对话记录进行**增删改查**时（比如：火龙果的保质期是多少？），仅回复固定友好空话，不涉及任何操作细节、数据信息，下面是三条示例：\n"
-            "      ▶ 好的，我来帮你查找/操作\n"
-            "      ▶ 已收到指令，我马上为你处理\n"
-            "      ▶ 没问题，我这就帮你完成这个操作\n"
             "    - **厨房相关非操作意图**：用户咨询菜谱、烹饪技巧、食材搭配、储存方法等时，回复**专业、简洁、实用的厨房相关内容**，不发散、不闲聊，示例：\n"
             "      ▶ 用户问「西红柿炒蛋怎么做」→ 直接回复具体步骤，不扩展聊其他菜品；\n"
             "      ▶ 用户问「土豆怎么储存」→ 只讲储存方法，不聊土豆的其他吃法。\n"
@@ -1756,6 +1825,7 @@ class SmartFridgeAssistant:
         final = f"{safe_ai_reply}\n\n--- 系统操作 ---\n{db_text}"
         if self.ai.pending_actions and "确认" not in final:
             final += "\n\n💡 小提示：还有需要你确认的操作哦～回复“确认”执行，回复“取消”放弃。"
+        # 直接在 process_input 中异步播报，保证文字先显示后播报
         self.speech.speak(final)
         return final
 
