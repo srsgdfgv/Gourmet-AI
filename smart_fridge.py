@@ -22,6 +22,7 @@ import time
 import json
 import base64
 import signal
+import traceback
 import tempfile
 import subprocess
 import threading
@@ -52,6 +53,8 @@ CHUNK_DURATION = 0.08
 VOICE_DEBOUNCE = 9
 # 整段录音上限（须大于 INITIAL_WAIT_SEC）；超时多为环境一直嘈杂、无法出现「说完后的静默」
 MAX_RECORD_DURATION = 28
+# 前端「点开始录音 → 点停止」单次上限（秒）
+MAX_MANUAL_RECORD_SEC = 120
 DB_SMOOTH_WIN = 8
 MIN_THRESHOLD = 10
 # 开口判定 = silence_threshold + 本值；厨房误触可提到 10，一般环境 6～8
@@ -417,6 +420,96 @@ class SpeechRecognizer:
             print("❌ 录音文件未生成")
             return False
 
+    def record_until_stop_requested(self) -> bool:
+        """持续采集麦克风 PCM，直到 request_stop、设备结束或达到 MAX_MANUAL_RECORD_SEC。用于前端「录音→停止」。"""
+        self.clear_stop()
+        temp_file = tempfile.NamedTemporaryFile(suffix=".pcm", delete=False)
+        temp_filename = temp_file.name
+        temp_file.close()
+        self.temp_audio_file = temp_filename
+
+        chunk_bytes = int(16000 * 2 * CHUNK_DURATION)
+        proc = None
+        audio_file = None
+        try:
+            proc = subprocess.Popen(
+                [
+                    "arecord",
+                    "-D",
+                    MIC_DEVICE,
+                    "-f",
+                    "S16_LE",
+                    "-r",
+                    "16000",
+                    "-c",
+                    "1",
+                    "-q",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            audio_file = open(temp_filename, "wb")
+            start_time = time.time()
+            print("🎙️ 手动录音：等待前端停止…")
+            while True:
+                if self.is_stop_requested():
+                    print("\n🛑 手动停止录音")
+                    break
+                if time.time() - start_time >= MAX_MANUAL_RECORD_SEC:
+                    print(f"\n⏰ 手动录音已达上限（{MAX_MANUAL_RECORD_SEC}秒）")
+                    break
+                audio_chunk = proc.stdout.read(chunk_bytes)
+                if not audio_chunk:
+                    break
+                audio_file.write(audio_chunk)
+        except Exception as e:
+            print(f"\n❌ 手动录音异常：{e}")
+            traceback.print_exc()
+            try:
+                if os.path.exists(temp_filename):
+                    os.unlink(temp_filename)
+            except Exception:
+                pass
+            self.temp_audio_file = None
+            return False
+        finally:
+            try:
+                if audio_file:
+                    audio_file.close()
+            except Exception:
+                pass
+            try:
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        try:
+            if not self.temp_audio_file or not os.path.exists(self.temp_audio_file):
+                return False
+            size = os.path.getsize(self.temp_audio_file)
+            if size < MIN_VALID_AUDIO_BYTES:
+                print("⚠️ 手动录音过短，无法识别")
+                try:
+                    os.unlink(self.temp_audio_file)
+                except Exception:
+                    pass
+                self.temp_audio_file = None
+                return False
+            print(f"✅ 手动录音完成（{size} 字节）")
+            return True
+        except Exception as e:
+            print(f"⚠️ 检查手动录音文件失败: {e}")
+            self.temp_audio_file = None
+            return False
+
     def get_access_token(self) -> Optional[str]:
         current_time = time.time()
         if self.access_token and current_time < self.token_expire_time:
@@ -465,12 +558,8 @@ class SpeechRecognizer:
             print(f"❌ 识别过程出错: {e}")
             return None
 
-    def listen_and_recognize(self) -> Optional[str]:
-        while self.is_tts_busy():
-            # 强制等待播报完整结束后再录音，避免并发抢占导致误录
-            time.sleep(0.05)
-        if not self.record_audio_adaptive():
-            return None
+    def transcribe_temp_pcm_and_cleanup(self) -> Optional[str]:
+        """将当前 temp_audio_file 送百度识别并删除临时文件。"""
         text = None
         if self.temp_audio_file and os.path.exists(self.temp_audio_file):
             text = self.recognize_speech(self.temp_audio_file)
@@ -478,9 +567,17 @@ class SpeechRecognizer:
             if self.temp_audio_file and os.path.exists(self.temp_audio_file):
                 os.unlink(self.temp_audio_file)
                 self.temp_audio_file = None
-        except:
+        except Exception:
             pass
         return text
+
+    def listen_and_recognize(self) -> Optional[str]:
+        while self.is_tts_busy():
+            # 强制等待播报完整结束后再录音，避免并发抢占导致误录
+            time.sleep(0.05)
+        if not self.record_audio_adaptive():
+            return None
+        return self.transcribe_temp_pcm_and_cleanup()
 
     # 新增：TTS合成与播放相关方法
     def synthesize_speech(self, text: str, out_path: str, per: int = 0, vol: int = BAIDU_TTS_VOL_MAX, spd: int = 8, pit: int = 7) -> bool:
@@ -643,8 +740,13 @@ class SpeechRecognizer:
         if not text or not text.strip():
             return
         try:
-            # 清理文本：只播报核心回复，去掉DB ACTIONS技术内容
+            # 清理文本：只播报核心回复，去掉 DB 技术段
             clean_text = text.split("--- 系统操作 ---")[0].strip()
+            if not clean_text:
+                # 避免「分隔符前为空」时整条不播报（用户会感觉完全无语音）
+                clean_text = text.strip()
+            if not clean_text:
+                return
             t = threading.Thread(target=self.speak_async_worker, args=(clean_text, per, vol, spd, pit), daemon=True)
             t.start()
         except Exception as e:
@@ -1567,10 +1669,24 @@ class SmartFridgeAssistant:
                 parts.append(f"{name}：{qty}{unit}")
         return "冰箱当前有：" + "；".join(parts)
 
-    def process_input(self, user_input: str) -> str:
+    def _return_with_speech(self, full_text: str) -> str:
+        """所有语音/手动录音入口统一播报后再返回，行为与原先「仅最后一支」一致但覆盖早退分支。"""
+        if full_text and str(full_text).strip():
+            try:
+                self.speech.speak(full_text)
+            except Exception:
+                pass
+        return full_text
+
+    def process_input(self, user_input: str, enable_tts: bool = True) -> str:
+        def finish(msg: str) -> str:
+            if enable_tts:
+                return self._return_with_speech(msg)
+            return msg
+
         text = (user_input or "").strip()
         if not text:
-            return "请说点什么吧~\n\n--- 系统操作 ---\n无"
+            return finish("请说点什么吧~\n\n--- 系统操作 ---\n无")
 
         # pending confirm/cancel handling
         if self.ai.pending_actions:
@@ -1588,16 +1704,20 @@ class SmartFridgeAssistant:
                         res = self.ai._execute_action(act)
                         results.append(res)
                 res_text = "\n".join(results)
-                return f"已执行待确认操作：\n{res_text}\n\n--- 系统操作 ---\n{res_text if res_text else '无'}"
+                return finish(
+                    f"已执行待确认操作：\n{res_text}\n\n--- 系统操作 ---\n{res_text if res_text else '无'}"
+                )
             if any(p in norm for p in self.CANCEL_PHRASES):
                 cnt = len(self.ai.pending_actions)
                 self.ai.pending_actions.clear()
-                return f"已取消 {cnt} 项待确认的系统操作。\n\n--- 系统操作 ---\n已取消待确认操作"
+                return finish(
+                    f"已取消 {cnt} 项待确认的系统操作。\n\n--- 系统操作 ---\n已取消待确认操作"
+                )
 
         # quick exit
         if re.search(r'^\s*(退出|quit|exit|bye|再见)\s*$', text, re.I):
             self.ai.reset_conversation()
-            return "再见！祝你用餐愉快！👋\n\n--- 系统操作 ---\n无"
+            return finish("再见！祝你用餐愉快！👋\n\n--- 系统操作 ---\n无")
 
         context = self._get_context()
 
@@ -1700,7 +1820,9 @@ class SmartFridgeAssistant:
                     summary_lines.extend(pendings)
                 summary = "\n".join(summary_lines)
                 final_db_text = "\n".join(db_reports) if db_reports else "无"
-                return f"{ai_reply}\n\n操作摘要：\n{summary}\n\n--- 系统操作 ---\n{final_db_text}"
+                return finish(
+                    f"{ai_reply}\n\n操作摘要：\n{summary}\n\n--- 系统操作 ---\n{final_db_text}"
+                )
             else:
                 # explicit delete but AI didn't list names -> create a pending "clean_non_food" job and ask user to confirm
                 summary, lines = self._cleanup_non_food_records(explicit_confirm=False)
@@ -1710,7 +1832,7 @@ class SmartFridgeAssistant:
                 for l in lines[:5]:
                     db_reports.append(f" - {l}")
                 db_text = "\n".join(db_reports) if db_reports else "无"
-                return f"{ai_reply}\n\n{summary}\n\n--- 系统操作 ---\n{db_text}"
+                return finish(f"{ai_reply}\n\n{summary}\n\n--- 系统操作 ---\n{db_text}")
 
         # 6) 本地快捷命令：仅在 deep_actions 为空时触发（避免重复）
         if not deep_actions:
@@ -1725,7 +1847,7 @@ class SmartFridgeAssistant:
                         parts.append(f"{k}：{', '.join(vs)}")
                     reply = "当前已记录的偏好有：" + "；".join(parts)
                 db_text = "\n".join(db_reports) if db_reports else "无"
-                return f"{reply}\n\n--- 系统操作 ---\n{db_text}"
+                return finish(f"{reply}\n\n--- 系统操作 ---\n{db_text}")
 
             # 本地快速添加食材（只作为最后的兜底）
             if any(k in text for k in ["添加", "加入"]) and re.search(r'[\u4e00-\u9fa5]{2,20}', text):
@@ -1756,7 +1878,9 @@ class SmartFridgeAssistant:
                     except:
                         pass
                     db_text = "\n".join(db_reports) if db_reports else "无"
-                    return f"✅ 已添加：{ing.get('name')} {ing.get('quantity')}{ing.get('unit')}。\n\n--- 系统操作 ---\nEXECUTED add_ingredient: 已添加库存项 {ing.get('name')}（数量：{ing.get('quantity')}{ing.get('unit')})\n{db_text if db_text!='无' else ''}".strip()
+                    return finish(
+                        f"✅ 已添加：{ing.get('name')} {ing.get('quantity')}{ing.get('unit')}。\n\n--- 系统操作 ---\nEXECUTED add_ingredient: 已添加库存项 {ing.get('name')}（数量：{ing.get('quantity')}{ing.get('unit')})\n{db_text if db_text!='无' else ''}".strip()
+                    )
 
         # 查询冰箱
         if re.search(r'冰箱里有什么|有什么|列出食材|查看食材|现在有啥', text):
@@ -1764,7 +1888,7 @@ class SmartFridgeAssistant:
             friendly_read = f"{STATUS_FRIENDLY_MAP['READ']}：冰箱里目前有 {len(self.db.get_ingredients())} 种食材"
             db_reports.insert(0, friendly_read)
             db_text = "\n".join(db_reports) if db_reports else "无"
-            return f"{read_text}\n\n--- 系统操作 ---\n{db_text}"
+            return finish(f"{read_text}\n\n--- 系统操作 ---\n{db_text}")
 
         # 做菜意图（餐次 vs 具体菜名）
         cook_name = None
@@ -1797,14 +1921,16 @@ class SmartFridgeAssistant:
                 db_reports.append(f"{STATUS_FRIENDLY_MAP['READ']}：冰箱里目前有 {len(ings)} 种食材（用于菜谱推荐）")
                 rec = self.ai.chat(prompt, {"ingredients": ings, "preferences": pref})
                 db_text = "\n".join(db_reports) if db_reports else "无"
-                return f"{rec}\n\n--- 系统操作 ---\n{db_text}"
+                return finish(f"{rec}\n\n--- 系统操作 ---\n{db_text}")
 
             # specific recipe name: create pending to mark made or add recipe
             r = self.db.find_recipe_by_title(cook_name)
             if r:
                 self.ai.pending_actions.append({"id": int(time.time() * 1000), "action": "mark_recipe_made", "params": {"title": cook_name}, "reason": "用户确认标记已做"})
                 db_text = "\n".join(db_reports) if db_reports else "无"
-                return f"你想做「{cook_name}」。我已准备将该菜谱记录为已做，请回复“确认”以保存并记录，或回复“取消”取消。\n\n--- 系统操作 ---\nPENDING mark_recipe_made: 等待用户确认以记录制作记录\n{db_text if db_text!='无' else ''}".strip()
+                return finish(
+                    f"你想做「{cook_name}」。我已准备将该菜谱记录为已做，请回复“确认”以保存并记录，或回复“取消”取消。\n\n--- 系统操作 ---\nPENDING mark_recipe_made: 等待用户确认以记录制作记录\n{db_text if db_text!='无' else ''}".strip()
+                )
             else:
                 last_assistant = ""
                 for m in reversed(self.ai.messages):
@@ -1815,13 +1941,15 @@ class SmartFridgeAssistant:
                 instructions = last_assistant or f"用户决定做「{cook_name}」，无详细做法记录。"
                 self.ai.pending_actions.append({"id": int(time.time() * 1000), "action": "add_recipe", "params": {"title": cook_name, "ingredients": [], "instructions": instructions}, "reason": "用户确认保存菜谱"})
                 db_text = "\n".join(db_reports) if db_reports else "无"
-                return f"准备保存菜谱「{cook_name}」并标记为已做。请回复“确认”以保存并记录，或回复“取消”取消。\n\n--- 系统操作 ---\nPENDING add_recipe: 等待用户确认以保存菜谱\n{db_text if db_text!='无' else ''}".strip()
+                return finish(
+                    f"准备保存菜谱「{cook_name}」并标记为已做。请回复“确认”以保存并记录，或回复“取消”取消。\n\n--- 系统操作 ---\nPENDING add_recipe: 等待用户确认以保存菜谱\n{db_text if db_text!='无' else ''}".strip()
+                )
 
         # 若用户明确要求“清空不是食材的部分”，把请求转交给 AI（或列出清单）
         if re.search(r'清空.*不是食材|清理.*不是食材|删除.*不是食材', text):
             ai_resp = self.ai.chat("请列出冰箱中明显不是食材或异常的条目（逐项列出 name 或 id），以便用户确认删除。", context)
             db_text = "\n".join(db_reports) if db_reports else "无"
-            return f"{ai_resp}\n\n--- 系统操作 ---\n{db_text}"
+            return finish(f"{ai_resp}\n\n--- 系统操作 ---\n{db_text}")
 
         # 最终：以 AI 的自然回复为主，附上 系统操作报告
         safe_ai_reply = ai_reply or "抱歉，我暂时无法理解或处理该请求。"
@@ -1833,9 +1961,7 @@ class SmartFridgeAssistant:
         final = f"{safe_ai_reply}\n\n--- 系统操作 ---\n{db_text}"
         if self.ai.pending_actions and "确认" not in final:
             final += "\n\n💡 小提示：还有需要你确认的操作哦～回复“确认”执行，回复“取消”放弃。"
-        # 直接在 process_input 中异步播报，保证文字先显示后播报
-        self.speech.speak(final)
-        return final
+        return finish(final)
 
     # pending helpers
     def _execute_pending_all(self) -> str:

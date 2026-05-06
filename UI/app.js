@@ -65,12 +65,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- State ---
   let currentView = 'assistant';
-  let continuous = false;
+  let manualRecording = false;
   let busy = false;
   let activeFetchController = null;
-  const LISTEN_TIMEOUT = 70000;
-  let serverErrorCount = 0;
-  const SERVER_ERROR_STOP_THRESHOLD = 4;
 
   // recipes cache
   let recipesCache = null; // { parsed: [...], raw: {...}, fetchedAt: number }
@@ -312,98 +309,19 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  // --- listening / continuous loop (robust) ---
-  async function listenOnce() {
-    if (busy) return { error: 'busy' };
-    busy = true;
-    let phaseTimer = null;
-    setStatus('正在录音…');
-    phaseTimer = setTimeout(() => {
-      if (busy && statusBar) statusBar.innerText = '识别中…';
-    }, 650);
-    const controller = new AbortController();
-    activeFetchController = controller;
-    const signal = controller.signal;
-    const timeoutId = setTimeout(() => {
-      try { controller.abort(); } catch (e) {}
-    }, LISTEN_TIMEOUT);
-
-    try {
-      const resp = await fetch('/listen', { method: 'POST', signal });
-      clearTimeout(timeoutId);
-      if (phaseTimer) clearTimeout(phaseTimer);
-      activeFetchController = null;
-      if (!resp.ok) {
-        const t = await resp.text().catch(()=>resp.statusText);
-        return { error: 'server ' + resp.status + ' ' + t };
-      }
-      const j = await resp.json();
-      serverErrorCount = 0;
-      return j;
-    } catch (e) {
-      if (phaseTimer) clearTimeout(phaseTimer);
-      if (e && e.name === 'AbortError') return { error: 'aborted' };
-      return { error: e.message || String(e) };
-    } finally {
-      busy = false;
-      if (phaseTimer) clearTimeout(phaseTimer);
-      if (!continuous) setStatus('就绪');
-      activeFetchController = null;
-    }
-  }
-
-  let loopRunning = false;
-  async function continuousLoop() {
-    if (loopRunning) return;
-    loopRunning = true;
-    while (continuous) {
-      const res = await listenOnce();
-      if (!res) break;
-      if (res.error) {
-        if (res.error === 'aborted') break;
-        showToast('监听出错：' + res.error, 3000);
-        serverErrorCount++;
-        if (serverErrorCount >= SERVER_ERROR_STOP_THRESHOLD) {
-          continuous = false;
-          setStatus('连续监听已停止（错误）');
-          showToast('连续监听因多次错误已停止，请检查后端', 4000);
-          break;
-        }
-        await sleep(700);
-        continue;
-      }
-      const recognized = (res.recognized || '').trim();
-      const reply = (res.reply || '').trim();
-      if (recognized) {
-        appendUser(recognized);
-      } else if (reply) {
-        // 仅有回复（极少情况）时，不显示未识别，保留 UI 简洁性
-      } else {
-        // 识别为空时，不再持续刷屏“（未识别）”，保持等待下一次唤醒
-        // 如果希望单次识别后结束监听，可在此处停止循环
-        // continuous = false;
-        // setMicRecording(false);
-        // setStatus('就绪');
-        // hideMicBubble();
-        await sleep(220);
-        continue;
-      }
-      if (reply) appendAssistant(reply);
-      if (containsExit(recognized) || containsExit(reply)) {
-        continuous = false;
-        setStatus('就绪');
-        appendAssistant('已退出语音助手。');
-        hideMicBubble();
-        break;
-      }
-      await sleep(220);
-    }
-    loopRunning = false;
-  }
-
   function containsExit(text) { if (!text) return false; const s = text.toLowerCase(); return s.includes('再见')||s.includes('退出')||s.includes('bye')||s.includes('quit'); }
 
-  // mic click behavior
+  /** 与后端 TTS 一致：聊天里主要展示「--- 系统操作 ---」之前的自然语言；没有分隔符则全文展示 */
+  function assistantReplyForChat(full) {
+    if (full == null || full === '') return '';
+    const s = String(full);
+    const idx = s.indexOf('--- 系统操作 ---');
+    if (idx === -1) return s.trim();
+    const head = s.slice(0, idx).trim();
+    return head || s.trim();
+  }
+
+  // mic：第一次点击开始录音，第二次点击停止 → 后端 /listen/manual/* 转写并回复（与 web.ui.py 配套）
   if (mic) {
     function setMicRecording(on) {
       try {
@@ -416,40 +334,67 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     mic.addEventListener('click', async () => {
-      // 如果当前正在忙（有一次 /listen 请求在跑），点击则先请求停止
       if (busy && activeFetchController) {
         try { await fetch('/listen/stop', { method: 'POST' }); } catch (e) {}
         try { activeFetchController.abort(); } catch (e) {}
-        continuous = false;
-        setMicRecording(false);
-        setStatus('已请求停止后端录音');
-        hideMicBubble();
-        return;
-      }
-
-      // 如果已经在连续监听，点击则停止
-      if (continuous) {
-        continuous = false;
-        try { await fetch('/listen/stop', { method: 'POST' }); } catch (e) {}
-        try { if (activeFetchController) activeFetchController.abort(); } catch (e) {}
-        setMicRecording(false);
-        setStatus('已停止连续监听');
-        hideMicBubble();
-        return;
-      }
-
-      // 否则开始连续监听
-      continuous = true;
-      serverErrorCount = 0;
-      setMicRecording(true);
-      setStatus('正在监听 · 每轮将显示「正在录音… / 识别中…」');
-      continuousLoop().catch(e => {
-        console.warn('continuousLoop error', e);
-        showToast('连续监听异常: ' + (e && (e.message || e)), 4000);
-        continuous = false;
+        activeFetchController = null;
+        busy = false;
+        manualRecording = false;
         setMicRecording(false);
         setStatus('就绪');
-      });
+        hideMicBubble();
+        return;
+      }
+
+      if (manualRecording) {
+        setStatus('识别中…');
+        busy = true;
+        try {
+          const resp = await fetch('/listen/manual/stop', { method: 'POST' });
+          const j = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            showToast((j && j.error) ? j.error : ('停止录音失败 ' + resp.status), 4000);
+          } else {
+            const recognized = (j.recognized || '').trim();
+            const replyRaw = (j.reply != null && j.reply !== undefined) ? String(j.reply) : '';
+            const replyChat = assistantReplyForChat(replyRaw);
+            if (recognized) appendUser(recognized);
+            if (replyChat) appendAssistant(replyChat);
+            else if (replyRaw.trim()) appendAssistant(replyRaw.trim());
+            if (!recognized && !replyRaw.trim() && j.error) showToast(j.error, 3000);
+            if (containsExit(recognized) || containsExit(replyRaw)) {
+              appendAssistant('已退出语音助手。');
+            }
+          }
+        } catch (e) {
+          showToast('停止录音失败: ' + (e && (e.message || e)), 4000);
+        } finally {
+          busy = false;
+          manualRecording = false;
+          setMicRecording(false);
+          setStatus('就绪');
+          hideMicBubble();
+        }
+        return;
+      }
+
+      busy = true;
+      try {
+        const resp = await fetch('/listen/manual/start', { method: 'POST' });
+        const j = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          showToast((j && j.error) ? j.error : ('无法开始录音 ' + resp.status), 4000);
+          return;
+        }
+        manualRecording = true;
+        setMicRecording(true);
+        setStatus('录音中…再次点击停止');
+        try { showMicBubble('点击停止结束录音', { persistent: true }); } catch (e2) {}
+      } catch (e) {
+        showToast('开始录音失败: ' + (e && (e.message || e)), 4000);
+      } finally {
+        busy = false;
+      }
     });
     mic.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); mic.click(); } });
   }
@@ -1726,7 +1671,7 @@ async function fetchRecipeSteps(title, desc) {
     const resp = await fetch('/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: prompt }),
+      body: JSON.stringify({ text: prompt, tts: false }),
       signal: controller.signal
     });
     clearTimeout(timeout);
@@ -1861,7 +1806,7 @@ function renderCookingControls() {
   playBtn.innerText = '播放当前步骤';
   playBtn.onclick = async () => {
     try {
-      const resp = await fetch('/message', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: `请朗读以下烹饪步骤：${stepText}` }) });
+      const resp = await fetch('/message', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: `请朗读以下烹饪步骤：${stepText}`, tts: true }) });
       if (!resp.ok) showToast('播报请求失败');
       else {
         const j = await resp.json();

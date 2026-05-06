@@ -13,6 +13,8 @@ import sys
 import json
 import re
 import importlib.util
+import threading
+import time
 from datetime import datetime
 
 # 脚本所在目录即项目根（含 raspberry_pi_client.py、weight_scale.py、recog/ 等）
@@ -54,6 +56,10 @@ app = Flask(__name__, static_folder='.', static_url_path='')
 CORS(app)
 
 assistant = SmartFridgeAssistant(DEEPSEEK_API_KEY)
+
+# 前端「点录音 / 点停止」后台线程（树莓派麦克风连续写入直至 request_stop）
+manual_record_lock = threading.Lock()
+manual_record_thread = None
 
 
 # favicon route: return local file if present, else inline svg
@@ -422,6 +428,64 @@ def listen_stop():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/listen/manual/start', methods=['POST'])
+def listen_manual_start():
+    """开始一段手动控制的麦克风录音（与 VAD 无关），直至 /listen/manual/stop。"""
+    global manual_record_thread
+    with manual_record_lock:
+        if manual_record_thread is not None and not manual_record_thread.is_alive():
+            manual_record_thread = None
+        if manual_record_thread is not None and manual_record_thread.is_alive():
+            return jsonify({"error": "已在录音中"}), 409
+
+        def worker():
+            global manual_record_thread
+            try:
+                while assistant.speech.is_tts_busy():
+                    time.sleep(0.05)
+                assistant.speech.record_until_stop_requested()
+            finally:
+                with manual_record_lock:
+                    if manual_record_thread is threading.current_thread():
+                        manual_record_thread = None
+
+        manual_record_thread = threading.Thread(target=worker, daemon=True)
+        manual_record_thread.start()
+    return jsonify({"started": True})
+
+
+@app.route('/listen/manual/stop', methods=['POST'])
+def listen_manual_stop():
+    """停止手动录音 → 百度转写 → process_input 生成回复。"""
+    global manual_record_thread
+
+    try:
+        try:
+            assistant.speech.request_stop()
+        except Exception as e:
+            print(f"manual stop request_stop: {e}")
+
+        t = None
+        with manual_record_lock:
+            t = manual_record_thread
+        if t is not None:
+            t.join(timeout=35.0)
+            if t.is_alive():
+                return jsonify({"error": "停止录音超时，请重试"}), 500
+            with manual_record_lock:
+                if manual_record_thread is t:
+                    manual_record_thread = None
+
+        recognized = assistant.speech.transcribe_temp_pcm_and_cleanup()
+        if not recognized or not str(recognized).strip():
+            return jsonify({"recognized": "", "reply": ""})
+        reply = assistant.process_input(recognized)
+        return jsonify({"recognized": recognized or "", "reply": reply or ""})
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": f"处理失败: {e}"}), 500
+
+
 @app.route('/listen/gpio_last', methods=['GET'])
 def listen_gpio_last():
     """
@@ -442,7 +506,14 @@ def handle_message():
         text = (data.get('text') or "").strip()
         if not text:
             return jsonify({"reply": "请发送非空文本"}), 400
-        reply = assistant.process_input(text)
+        # 默认开启语音；前端传 tts / enable_tts 为 false 时可关闭（避免叠音）
+        if "tts" in data:
+            want_tts = bool(data.get("tts"))
+        elif "enable_tts" in data:
+            want_tts = bool(data.get("enable_tts"))
+        else:
+            want_tts = True
+        reply = assistant.process_input(text, enable_tts=want_tts)
         return jsonify({"reply": reply})
     except Exception as e:
         traceback.print_exc()
@@ -540,8 +611,6 @@ def api_history():
         return jsonify({"error": str(e)}), 500
 
 import RPi.GPIO as GPIO
-import threading
-import time
 
 # 定义 GPIO 引脚（BCM 编号）
 # GPIO4: 会话启动（上升沿）
