@@ -65,9 +65,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // --- State ---
   let currentView = 'assistant';
-  let manualRecording = false;
+  let continuous = false;
   let busy = false;
   let activeFetchController = null;
+  const LISTEN_TIMEOUT = 70000;
+  let serverErrorCount = 0;
+  const SERVER_ERROR_STOP_THRESHOLD = 4;
 
   // recipes cache
   let recipesCache = null; // { parsed: [...], raw: {...}, fetchedAt: number }
@@ -196,12 +199,34 @@ document.addEventListener('DOMContentLoaded', () => {
       .replace(/'/g, '&#39;');
   }
 
+  function getCurrentScrollable() {
+    try {
+      const curView = Array.from(document.querySelectorAll('.view')).find(v => {
+        const s = window.getComputedStyle(v);
+        return s.display !== 'none';
+      });
+      if (curView) {
+        const candidate = curView.querySelector(".messages, .content, .scrollable-area, #assistant_view");
+        if (candidate && candidate.scrollHeight > candidate.clientHeight) return candidate;
+      }
+      if (assistantView && assistantView.scrollHeight > assistantView.clientHeight) return assistantView;
+    } catch (e) { /* ignore */ }
+    return mainArea || document.scrollingElement || document.documentElement;
+  }
+
   // --- View switching ---
   function switchView(name) {
     try {
-      views.forEach(v => v.classList.toggle('is-active', v.id === name));
+      views.forEach(v => v.style.display = (v.id === name ? '' : 'none'));
       menuButtons.forEach(btn => btn.classList.toggle('active', btn.dataset.view === name));
       currentView = name;
+
+      const activeView = document.getElementById(name);
+      if (activeView) {
+        activeView.classList.remove('view-animate');
+        void activeView.offsetWidth;
+        activeView.classList.add('view-animate');
+      }
 
       // 更新顶部标题 - 显示当前功能
       if (mainTitle) {
@@ -288,6 +313,371 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   micBubble.addEventListener && micBubble.addEventListener('click', () => { switchView('assistant'); hideMicBubble(); });
 
+  /** 读取 POST /ingredients/scan 返回的 NDJSON 流，每行一个 JSON */
+  async function readNdjsonLines(response, onObject) {
+    const reader = response.body && response.body.getReader ? response.body.getReader() : null;
+    const decoder = new TextDecoder();
+    let buffer = '';
+    if (!reader) {
+      const text = await response.text();
+      for (const line of text.split(/\n/)) {
+        const s = line.trim();
+        if (!s) continue;
+        try {
+          onObject(JSON.parse(s));
+        } catch (e) { /* ignore */ }
+      }
+      return;
+    }
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          onObject(JSON.parse(line));
+        } catch (e) {
+          onObject({ step: 'parse_error', raw: line });
+        }
+      }
+    }
+    const tail = buffer.trim();
+    if (tail) {
+      try {
+        onObject(JSON.parse(tail));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  /** 称重进度 event → 面向用户的短句（不展示原始 JSON） */
+  function friendlyWeightProgressMessage(ev) {
+    if (!ev || typeof ev !== 'object') return '';
+    if (ev.message) return String(ev.message);
+    const ph = ev.phase;
+    if (ph === 'tare_first') return '正在校准电子秤…';
+    if (ph === 'empty_wait') return '请先不要将食材放在秤上，等待空秤稳定…';
+    if (ph === 'empty_tick') return '正在确认空秤，请勿放食材…';
+    if (ph === 'tare_lock') return '空秤已确认，正在锁定零点…';
+    if (ph === 'zero_locked') return '请将果蔬置于秤上，保持静止直至完成…';
+    if (ph === 'weight_tick') return '正在读取重量，请保持静止…';
+    if (ph === 'stable_weight') return '称重已完成，正在识别食材…';
+    return '';
+  }
+
+  /** 解析 NDJSON 扫描流，只更新简短状态，详细对象仅写入 console */
+  function handleScanNdjsonObject(obj, setHint, wrapForClose) {
+    const step = obj.step || '';
+    if (step === 'parse_error') return;
+    if (step === 'weight_progress' && obj.event) {
+      const line = friendlyWeightProgressMessage(obj.event);
+      if (line) setHint(line);
+      return;
+    }
+    if (obj.message) {
+      setHint(String(obj.message));
+      return;
+    }
+    if (step === 'recognize_result') {
+      setHint('正在处理识别结果…');
+      return;
+    }
+    if (step === 'done' && obj.ingredient) {
+      const ing = obj.ingredient;
+      setHint('已完成，食材已写入库存。');
+      showToast('已添加：' + (ing.name || '') + ' ' + (ing.quantity || '') + (ing.unit || ''), 5000);
+      setTimeout(() => {
+        try {
+          if (wrapForClose && wrapForClose.parentNode) document.body.removeChild(wrapForClose);
+        } catch (e2) { /* */ }
+        loadInventory();
+      }, 600);
+      return;
+    }
+    if (step === 'error') {
+      const err = obj.error || '操作失败';
+      setHint(err);
+      showToast(err, 5000);
+      console.warn('ingredients/scan error', obj);
+    }
+  }
+
+  /** 自动入库：仅区域选择 + 简要状态（与 POST /ingredients/scan 一致） */
+  function showAutoScanModal() {
+    const formHtml = `
+      <div style="display:grid;gap:16px">
+        <label style="font-size:14px;font-weight:600">存放区域</label>
+        <select id="scan_fridge_area" style="padding:12px 14px;border-radius:10px;border:1px solid rgba(0,0,0,0.1);font-size:15px">
+          <option value="冷藏区">冷藏区</option>
+          <option value="冷冻区">冷冻区</option>
+        </select>
+        <div style="padding:14px;border-radius:10px;background:rgba(59,130,246,0.08);border:1px solid rgba(59,130,246,0.22);font-size:14px;line-height:1.65;color:inherit">
+          <strong>请先不要将食材放在秤上。</strong>点击「开始」后请保持<strong>空秤</strong>稳定；界面提示后再将<strong>果蔬</strong>放上秤盘。仅果蔬类会写入库存（单位为克）。
+        </div>
+        <div id="auto_scan_hint" style="min-height:1.5em;font-size:14px;color:var(--muted)"></div>
+        <div style="display:flex;gap:10px;margin-top:4px">
+          <button type="button" id="scan_cancel_btn" class="btn ghost" style="flex:1;padding:12px">关闭</button>
+          <button type="button" id="scan_start_btn" class="btn" style="flex:1;padding:12px;background:var(--success);border-color:var(--success)">开始</button>
+        </div>
+      </div>`;
+
+    const wrap = showModal('自动称重识别', formHtml, { maxWidth: '440px' });
+    const setHint = (s) => {
+      const el = document.getElementById('auto_scan_hint');
+      if (el) el.textContent = s || '';
+    };
+
+    document.getElementById('scan_cancel_btn').addEventListener('click', () => {
+      try {
+        document.body.removeChild(wrap);
+      } catch (e) { /* */ }
+    });
+
+    document.getElementById('scan_start_btn').addEventListener('click', async () => {
+      const btn = document.getElementById('scan_start_btn');
+      const body = {
+        fridge_area: document.getElementById('scan_fridge_area').value,
+        expiry_days: 7,
+        notes: '',
+      };
+      setHint('正在连接…');
+      btn.disabled = true;
+
+      try {
+        const resp = await fetch('/ingredients/scan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        if (!resp.ok) {
+          setHint('连接失败，请稍后重试。');
+          console.warn('ingredients/scan HTTP', resp.status);
+          showToast('扫描入库失败', 4000);
+          btn.disabled = false;
+          return;
+        }
+        await readNdjsonLines(resp, (obj) => handleScanNdjsonObject(obj, setHint, wrap));
+      } catch (e) {
+        setHint('网络异常，请重试。');
+        console.error('ingredients/scan', e);
+        showToast('请求异常', 4000);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  /** 添加食物入口：手动填写 或 自动称重识别 */
+  function showAddFoodEntryModal() {
+    const html = `
+      <div style="display:grid;gap:16px">
+        <p style="margin:0;color:var(--muted);font-size:14px;line-height:1.6">请选择添加方式。</p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+          <button type="button" id="add_mode_manual" class="btn ghost" style="padding:14px;font-size:15px">手动填写</button>
+          <button type="button" id="add_mode_auto" class="btn" style="padding:14px;font-size:15px;background:var(--accent);border-color:var(--accent);color:#fff">自动识别</button>
+        </div>
+      </div>`;
+    const overlay = showModal('添加食物', html, { maxWidth: '420px' });
+    document.getElementById('add_mode_manual').addEventListener('click', () => {
+      try {
+        document.body.removeChild(overlay);
+      } catch (e) { /* */ }
+      showManualAddFoodModal();
+    });
+    document.getElementById('add_mode_auto').addEventListener('click', () => {
+      try {
+        document.body.removeChild(overlay);
+      } catch (e) { /* */ }
+      showAutoScanModal();
+    });
+  }
+
+  /** 设置页：标签切换 + GET /api/history（与 web.ui.py 一致） */
+  function initSettingsTabsAndHistory() {
+    const tabs = document.querySelectorAll('.settings-tab-btn');
+    const prefPanel = document.getElementById('settings_prefs_panel');
+    const histPanel = document.getElementById('settings_history_panel');
+    const statsPanel = document.getElementById('settings_stats_panel');
+    const historyList = document.getElementById('history_list');
+    const statsContent = document.getElementById('stats_content');
+
+    async function loadApiHistory() {
+      if (!historyList) return;
+      historyList.innerHTML = '<div style="text-align:center;color:var(--muted);padding:12px">加载中…</div>';
+      try {
+        const r = await fetch('/api/history');
+        if (!r.ok) {
+          historyList.innerHTML = '<div style="color:var(--danger)">加载失败 ' + r.status + '</div>';
+          return;
+        }
+        const j = await r.json();
+        const parts = [];
+        const rh = j.recipe_history || [];
+        const ch = j.conversation_history || [];
+        const am = j.ai_messages || [];
+        if (rh.length) {
+          parts.push('<div style="font-weight:700;margin-bottom:8px">菜谱历史</div>');
+          rh.slice(0, 30).forEach((row) => {
+            parts.push(`<div style="padding:8px;border-radius:8px;background:rgba(0,0,0,0.04);margin-bottom:6px;font-size:13px">${escapeHtml(String(row.title || row.name || JSON.stringify(row)).slice(0, 200))}</div>`);
+          });
+        }
+        if (ch.length) {
+          parts.push('<div style="font-weight:700;margin:12px 0 8px">对话记录</div>');
+          ch.slice(-40).forEach((row) => {
+            const role = escapeHtml(String(row.role || ''));
+            const c = escapeHtml(String(row.content || '').slice(0, 300));
+            parts.push(`<div style="padding:8px;border-radius:8px;background:rgba(0,0,0,0.04);margin-bottom:6px;font-size:13px"><strong>${role}</strong>：${c}</div>`);
+          });
+        }
+        if (am.length) {
+          parts.push('<div style="font-weight:700;margin:12px 0 8px">近期 AI 消息（内存）</div>');
+          am.forEach((m) => {
+            const role = escapeHtml(String(m.role || ''));
+            const c = escapeHtml(String((m.content || '').slice(0, 200)));
+            parts.push(`<div style="padding:8px;border-radius:8px;background:rgba(0,0,0,0.04);margin-bottom:6px;font-size:13px"><strong>${role}</strong>：${c}</div>`);
+          });
+        }
+        if (!parts.length) {
+          historyList.innerHTML = '<div style="color:var(--muted);padding:12px">暂无历史数据</div>';
+          return;
+        }
+        historyList.innerHTML = parts.join('');
+      } catch (e) {
+        historyList.innerHTML = '<div style="color:var(--danger)">异常：' + escapeHtml(String(e)) + '</div>';
+      }
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => {
+        tabs.forEach((t) => t.classList.remove('active'));
+        tab.classList.add('active');
+        const id = tab.getAttribute('data-tab');
+        if (prefPanel) prefPanel.style.display = id === 'prefs' ? '' : 'none';
+        if (histPanel) histPanel.style.display = id === 'history' ? '' : 'none';
+        if (statsPanel) statsPanel.style.display = id === 'stats' ? '' : 'none';
+        if (id === 'history') loadApiHistory();
+        if (id === 'stats' && statsContent) {
+          statsContent.innerHTML = '<div style="color:var(--muted);padding:12px">统计接口未在 web.ui.py 中提供；可后续扩展。</div>';
+        }
+      });
+    });
+
+    const refH = document.getElementById('refresh_history_btn');
+    if (refH) refH.addEventListener('click', () => loadApiHistory());
+    const clrH = document.getElementById('clear_history_btn');
+    if (clrH) {
+      clrH.addEventListener('click', () => {
+        showToast('后端未提供清空历史的 API，仅可刷新查看', 4000);
+      });
+    }
+  }
+
+  /** index.html 语音弹窗：/listen/manual/start + /listen/manual/stop */
+  function initVoiceAssistantModal() {
+    const back = document.getElementById('modalBackdrop');
+    const btnOpen = document.getElementById('openVoiceModalBtn');
+    const btnListen = document.getElementById('modalListen');
+    const btnToggle = document.getElementById('modalToggleContinuous');
+    const btnClose = document.getElementById('modalClose');
+    const msgEl = document.getElementById('modalMessages');
+    const stEl = document.getElementById('modalStatus');
+    if (!back || !btnListen) return;
+
+    let modalRecording = false;
+    let modalContinuous = false;
+
+    function setStatus(t) {
+      if (stEl) stEl.innerText = t;
+    }
+
+    function appendModalLine(role, text) {
+      if (!msgEl) return;
+      const d = document.createElement('div');
+      d.style.marginBottom = '8px';
+      d.style.fontSize = '14px';
+      d.innerHTML = '<strong>' + escapeHtml(role) + '</strong>：' + escapeHtml(text);
+      msgEl.appendChild(d);
+      msgEl.scrollTop = msgEl.scrollHeight;
+    }
+
+    function syncToggleLabel() {
+      if (btnToggle) btnToggle.innerText = modalContinuous ? '持续：开' : '持续：关';
+    }
+    syncToggleLabel();
+
+    if (btnOpen) {
+      btnOpen.addEventListener('click', () => {
+        back.style.display = 'flex';
+        setStatus('就绪');
+      });
+    }
+    if (btnClose) {
+      btnClose.addEventListener('click', () => {
+        back.style.display = 'none';
+      });
+    }
+    if (btnToggle) {
+      btnToggle.addEventListener('click', () => {
+        modalContinuous = !modalContinuous;
+        syncToggleLabel();
+      });
+    }
+
+    btnListen.addEventListener('click', async () => {
+      if (modalRecording) {
+        setStatus('识别中…');
+        try {
+          const resp = await fetch('/listen/manual/stop', { method: 'POST' });
+          const j = await resp.json().catch(() => ({}));
+          modalRecording = false;
+          btnListen.innerText = '开始录音';
+          if (j.error) {
+            setStatus('错误');
+            appendModalLine('系统', String(j.error));
+            return;
+          }
+          const rec = (j.recognized || '').trim();
+          const rep = (j.reply || '').trim();
+          if (rec) appendModalLine('用户', rec);
+          if (rep) appendModalLine('助手', rep);
+          setStatus('就绪');
+          if (modalContinuous) {
+            setTimeout(() => {
+              btnListen.click();
+            }, 400);
+          }
+        } catch (e) {
+          modalRecording = false;
+          btnListen.innerText = '开始录音';
+          setStatus('异常');
+          appendModalLine('系统', String(e));
+        }
+        return;
+      }
+
+      try {
+        const resp = await fetch('/listen/manual/start', { method: 'POST' });
+        const j = await resp.json().catch(() => ({}));
+        if (!resp.ok) {
+          if (resp.status === 409) {
+            appendModalLine('系统', j.error || '已在录音中');
+            return;
+          }
+          appendModalLine('系统', '无法开始：' + resp.status);
+          return;
+        }
+        modalRecording = true;
+        btnListen.innerText = '停止并识别';
+        setStatus('录音中…点同一按钮结束');
+      } catch (e) {
+        appendModalLine('系统', String(e));
+      }
+    });
+  }
+
   // --- fullscreen robust toggle ---
   if (fullscreenBtn) {
     fullscreenBtn.addEventListener('click', async () => {
@@ -309,92 +699,136 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function containsExit(text) { if (!text) return false; const s = text.toLowerCase(); return s.includes('再见')||s.includes('退出')||s.includes('bye')||s.includes('quit'); }
+  // --- listening / continuous loop (robust) ---
+  async function listenOnce() {
+    if (busy) return { error: 'busy' };
+    busy = true;
+    setStatus('正在录音并识别…');
+    const controller = new AbortController();
+    activeFetchController = controller;
+    const signal = controller.signal;
+    const timeoutId = setTimeout(() => {
+      try { controller.abort(); } catch (e) {}
+    }, LISTEN_TIMEOUT);
 
-  /** 与后端 TTS 一致：聊天里主要展示「--- 系统操作 ---」之前的自然语言；没有分隔符则全文展示 */
-  function assistantReplyForChat(full) {
-    if (full == null || full === '') return '';
-    const s = String(full);
-    const idx = s.indexOf('--- 系统操作 ---');
-    if (idx === -1) return s.trim();
-    const head = s.slice(0, idx).trim();
-    return head || s.trim();
+    try {
+      const resp = await fetch('/listen', { method: 'POST', signal });
+      clearTimeout(timeoutId);
+      activeFetchController = null;
+      if (!resp.ok) {
+        const t = await resp.text().catch(()=>resp.statusText);
+        return { error: 'server ' + resp.status + ' ' + t };
+      }
+      const j = await resp.json();
+      serverErrorCount = 0;
+      return j;
+    } catch (e) {
+      if (e && e.name === 'AbortError') return { error: 'aborted' };
+      return { error: e.message || String(e) };
+    } finally {
+      busy = false;
+      if (!continuous) setStatus('就绪');
+      activeFetchController = null;
+    }
   }
 
-  // mic：第一次点击开始录音，第二次点击停止 → 后端 /listen/manual/* 转写并回复（与 web.ui.py 配套）
+  let loopRunning = false;
+  async function continuousLoop() {
+    if (loopRunning) return;
+    loopRunning = true;
+    while (continuous) {
+      const res = await listenOnce();
+      if (!res) break;
+      if (res.error) {
+        if (res.error === 'aborted') break;
+        showToast('监听出错：' + res.error, 3000);
+        serverErrorCount++;
+        if (serverErrorCount >= SERVER_ERROR_STOP_THRESHOLD) {
+          continuous = false;
+          setStatus('连续监听已停止（错误）');
+          showToast('连续监听因多次错误已停止，请检查后端', 4000);
+          break;
+        }
+        await sleep(700);
+        continue;
+      }
+      const recognized = (res.recognized || '').trim();
+      const reply = (res.reply || '').trim();
+      if (recognized) {
+        appendUser(recognized);
+      } else if (reply) {
+        // 仅有回复（极少情况）时，不显示未识别，保留 UI 简洁性
+      } else {
+        // 识别为空时，不再持续刷屏“（未识别）”，保持等待下一次唤醒
+        // 如果希望单次识别后结束监听，可在此处停止循环
+        // continuous = false;
+        // setMicRecording(false);
+        // setStatus('就绪');
+        // hideMicBubble();
+        await sleep(220);
+        continue;
+      }
+      if (reply) appendAssistant(reply);
+      if (containsExit(recognized) || containsExit(reply)) {
+        continuous = false;
+        setStatus('就绪');
+        appendAssistant('已退出语音助手。');
+        hideMicBubble();
+        break;
+      }
+      await sleep(220);
+    }
+    loopRunning = false;
+  }
+
+  function containsExit(text) { if (!text) return false; const s = text.toLowerCase(); return s.includes('再见')||s.includes('退出')||s.includes('bye')||s.includes('quit'); }
+
+  // mic click behavior
   if (mic) {
     function setMicRecording(on) {
       try {
         mic.classList.toggle('recording', !!on);
+        mic.classList.toggle('off', !on);
         mic.setAttribute('aria-pressed', on ? 'true' : 'false');
-        const lab = mic.querySelector('.mic-label');
-        if (lab) lab.textContent = on ? '停止' : '录音';
-        else mic.textContent = on ? '停止' : '录音';
+        mic.innerText = on ? '停止' : '录音';
       } catch (e) { /* ignore */ }
     }
 
     mic.addEventListener('click', async () => {
+      // 如果当前正在忙（有一次 /listen 请求在跑），点击则先请求停止
       if (busy && activeFetchController) {
         try { await fetch('/listen/stop', { method: 'POST' }); } catch (e) {}
         try { activeFetchController.abort(); } catch (e) {}
-        activeFetchController = null;
-        busy = false;
-        manualRecording = false;
+        continuous = false;
         setMicRecording(false);
-        setStatus('就绪');
+        setStatus('已请求停止后端录音');
         hideMicBubble();
         return;
       }
 
-      if (manualRecording) {
-        setStatus('识别中…');
-        busy = true;
-        try {
-          const resp = await fetch('/listen/manual/stop', { method: 'POST' });
-          const j = await resp.json().catch(() => ({}));
-          if (!resp.ok) {
-            showToast((j && j.error) ? j.error : ('停止录音失败 ' + resp.status), 4000);
-          } else {
-            const recognized = (j.recognized || '').trim();
-            const replyRaw = (j.reply != null && j.reply !== undefined) ? String(j.reply) : '';
-            const replyChat = assistantReplyForChat(replyRaw);
-            if (recognized) appendUser(recognized);
-            if (replyChat) appendAssistant(replyChat);
-            else if (replyRaw.trim()) appendAssistant(replyRaw.trim());
-            if (!recognized && !replyRaw.trim() && j.error) showToast(j.error, 3000);
-            if (containsExit(recognized) || containsExit(replyRaw)) {
-              appendAssistant('已退出语音助手。');
-            }
-          }
-        } catch (e) {
-          showToast('停止录音失败: ' + (e && (e.message || e)), 4000);
-        } finally {
-          busy = false;
-          manualRecording = false;
-          setMicRecording(false);
-          setStatus('就绪');
-          hideMicBubble();
-        }
+      // 如果已经在连续监听，点击则停止
+      if (continuous) {
+        continuous = false;
+        try { await fetch('/listen/stop', { method: 'POST' }); } catch (e) {}
+        try { if (activeFetchController) activeFetchController.abort(); } catch (e) {}
+        setMicRecording(false);
+        setStatus('已停止连续监听');
+        hideMicBubble();
         return;
       }
 
-      busy = true;
-      try {
-        const resp = await fetch('/listen/manual/start', { method: 'POST' });
-        const j = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          showToast((j && j.error) ? j.error : ('无法开始录音 ' + resp.status), 4000);
-          return;
-        }
-        manualRecording = true;
-        setMicRecording(true);
-        setStatus('录音中…再次点击停止');
-        try { showMicBubble('点击停止结束录音', { persistent: true }); } catch (e2) {}
-      } catch (e) {
-        showToast('开始录音失败: ' + (e && (e.message || e)), 4000);
-      } finally {
-        busy = false;
-      }
+      // 否则开始连续监听
+      continuous = true;
+      serverErrorCount = 0;
+      setMicRecording(true);
+      setStatus('监听中（持续）');
+      continuousLoop().catch(e => {
+        console.warn('continuousLoop error', e);
+        showToast('连续监听异常: ' + (e && (e.message || e)), 4000);
+        continuous = false;
+        setMicRecording(false);
+        setStatus('就绪');
+      });
     });
     mic.addEventListener('keydown', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); mic.click(); } });
   }
@@ -430,7 +864,7 @@ document.addEventListener('DOMContentLoaded', () => {
       // 创建库存界面HTML - 更新分类选项
       inventoryContent.innerHTML = `
         <!-- 统计信息行 -->
-        <div class="stats-strip-glass" style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding:12px;border-radius:10px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;padding:12px;background:var(--panel);border-radius:10px;box-shadow:0 4px 12px rgba(0,0,0,0.05)">
           <div style="text-align:center;flex:1">
             <div style="font-size:24px;font-weight:700;color:var(--accent)">${totalItems}</div>
             <div style="font-size:12px;color:var(--muted)">总品类数</div>
@@ -484,16 +918,14 @@ document.addEventListener('DOMContentLoaded', () => {
       // 渲染食材列表
       renderInventoryItems(items);
 
+      // 绑定添加食物（含手动 / 自动入口）
+      bindAddFormEvents();
+
       // 绑定筛选事件
       document.getElementById('applyFilter').addEventListener('click', () => applyFilters(items));
       document.getElementById('clearFilter').addEventListener('click', () => clearFilters(items));
       document.getElementById('searchInput').addEventListener('input', (e) => {
         if (e.target.value === '') applyFilters(items);
-      });
-
-      // 绑定添加食物按钮
-      document.getElementById('addFoodBtn').addEventListener('click', () => {
-        showAddFoodModal();
       });
 
     } catch (e) {
@@ -502,31 +934,19 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // 显示添加食物悬浮窗（手动填写 或 识别+称重 自动入库）
-  function showAddFoodModal() {
+  // 绑定「添加食物」→ 先选手动 / 自动（避免重复绑定只绑一次）
+  function bindAddFormEvents() {
+    const addBtn = document.getElementById('addFoodBtn');
+    if (!addBtn || addBtn.dataset.bound === '1') return;
+    addBtn.dataset.bound = '1';
+    addBtn.addEventListener('click', () => {
+      showAddFoodEntryModal();
+    });
+  }
+
+  // 手动填写：完整表单
+  function showManualAddFoodModal() {
     const formHtml = `
-      <div id="addFoodStepPick">
-        <p style="color:var(--muted);margin-bottom:12px;font-size:14px;line-height:1.5">请选择添加方式：手动填写信息，或通过摄像头与电子秤自动识别种类并称重后写入库存。</p>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <button type="button" id="pickManualBtn" class="btn" style="flex:1;min-width:130px;padding:12px">✏️ 手动填写</button>
-          <button type="button" id="pickScanBtn" class="btn" style="flex:1;min-width:130px;background:var(--accent);border-color:var(--accent);padding:12px">📷 测重后识别添加</button>
-        </div>
-      </div>
-
-      <div id="addFoodStepScan" style="display:none">
-        <p style="color:var(--muted);font-size:14px;margin-bottom:12px;line-height:1.55">流程：<strong>① 先称重</strong>（按下方提示先空秤确认零点，再放果蔬至稳定克数）；<strong>② 再摄像头识别</strong>。仅<strong>果蔬类</strong>才入库。</p>
-        <select id="scanFridgeArea" style="width:100%;padding:10px 12px;border:1px solid rgba(0,0,0,0.1);border-radius:8px;margin-bottom:12px;font-size:14px">
-          <option value="冷藏区">冷藏区</option>
-          <option value="冷冻区">冷冻区</option>
-        </select>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-          <button type="button" id="scanStartBtn" class="btn" style="flex:1;min-width:160px;background:var(--success);border-color:var(--success);padding:12px">先测重再识别</button>
-          <button type="button" id="scanBackBtn" class="btn ghost" style="padding:12px">返回</button>
-        </div>
-        <div id="scanUserHint" role="status" aria-live="polite" style="margin-top:4px;padding:12px 14px;border-radius:10px;background:rgba(47,141,230,0.08);border:1px solid rgba(15,23,32,0.08);font-size:14px;line-height:1.55;color:#0f1720">点击下方按钮开始：请先<strong>不要</strong>在秤上放置食材。</div>
-      </div>
-
-      <div id="addFoodStepManual" style="display:none">
       <form id="newIngredientForm" style="display:grid;grid-template-columns:repeat(auto-fit, minmax(150px, 1fr));gap:12px">
         <input type="text" name="name" placeholder="食材名称" required style="grid-column:1/-1;padding:10px 12px;border:1px solid rgba(0,0,0,0.1);border-radius:8px;font-size:14px">
 
@@ -587,14 +1007,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         <div style="grid-column:1/-1;display:flex;gap:8px;margin-top:8px">
           <button type="button" id="modalCancelBtn" class="btn ghost" style="flex:1;padding:12px">取消</button>
-          <button type="button" id="manualBackBtn" class="btn ghost" style="flex:1;padding:12px">返回</button>
           <button type="submit" class="btn" style="flex:1;background:var(--success);border-color:var(--success);padding:12px">确认添加</button>
         </div>
       </form>
-      </div>
     `;
 
-    const modal = showModal('添加新食材', formHtml, {
+    const modal = showModal('手动添加食材', formHtml, {
       maxWidth: '450px',
       onClose: () => {
         // 关闭时的清理操作
@@ -603,166 +1021,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // 绑定表单事件
     setTimeout(() => {
-      function showStep(step) {
-        const pick = document.getElementById('addFoodStepPick');
-        const manual = document.getElementById('addFoodStepManual');
-        const scan = document.getElementById('addFoodStepScan');
-        if (pick) pick.style.display = step === 'pick' ? '' : 'none';
-        if (manual) manual.style.display = step === 'manual' ? '' : 'none';
-        if (scan) scan.style.display = step === 'scan' ? '' : 'none';
-      }
-
-      document.getElementById('pickManualBtn').addEventListener('click', () => showStep('manual'));
-      document.getElementById('pickScanBtn').addEventListener('click', () => showStep('scan'));
-      document.getElementById('scanBackBtn').addEventListener('click', () => showStep('pick'));
-      const manualBack = document.getElementById('manualBackBtn');
-      if (manualBack) manualBack.addEventListener('click', () => showStep('pick'));
-
-      const SCAN_HINT_EMPTY = '① 请<strong>不要</strong>在秤上放置食材，正在确认零点…（保持秤盘空置）';
-      const SCAN_HINT_PLACE = '② 零点已确认，请将<strong>果蔬</strong>轻轻放在秤盘上，保持静止直至称重自动结束。';
-      const SCAN_HINT_WEIGHING = '正在读取重量，请勿挪动秤上物品…';
-      const SCAN_HINT_WEIGHT_DONE = '称重已完成，正在启动摄像头识别…';
-      const SCAN_HINT_RECOGNIZE = '正在识别食材，请将物品对准摄像头区域…';
-
-      function setScanUserHint(el, html) {
-        if (!el) return;
-        el.innerHTML = html;
-      }
-
-      /** 根据后端 NDJSON 更新提示文案（不再展示调试日志） */
-      function updateScanHintFromPayload(hintEl, j) {
-        if (!hintEl || !j || typeof j !== 'object') return;
-        if (j.step === 'init' || j.step === 'weight_phase') {
-          setScanUserHint(hintEl, SCAN_HINT_EMPTY);
-          return;
-        }
-        if (j.step === 'weight_progress' && j.event) {
-          const ph = j.event.phase;
-          if (ph === 'tare_first' || ph === 'empty_wait' || ph === 'empty_tick') {
-            setScanUserHint(hintEl, SCAN_HINT_EMPTY);
-            return;
-          }
-          if (ph === 'tare_lock' || ph === 'zero_locked') {
-            setScanUserHint(hintEl, SCAN_HINT_PLACE);
-            return;
-          }
-          if (ph === 'weight_tick') {
-            setScanUserHint(hintEl, SCAN_HINT_WEIGHING);
-            return;
-          }
-          return;
-        }
-        if (j.step === 'weight_complete') {
-          setScanUserHint(hintEl, SCAN_HINT_WEIGHT_DONE + (j.weight_g != null ? '（' + j.weight_g + ' 克）' : ''));
-          return;
-        }
-        if (j.step === 'recognize') {
-          setScanUserHint(hintEl, SCAN_HINT_RECOGNIZE);
-          return;
-        }
-        if (j.step === 'recognize_result') {
-          setScanUserHint(hintEl, '识别结果已返回，正在校验种类…');
-          return;
-        }
-        if (j.step === 'category') {
-          setScanUserHint(hintEl, '种类推断完成，准备写入…');
-          return;
-        }
-        if (j.step === 'commit') {
-          setScanUserHint(hintEl, '正在写入库存…');
-        }
-      }
-
-      document.getElementById('scanStartBtn').addEventListener('click', async () => {
-        const btn = document.getElementById('scanStartBtn');
-        const hintEl = document.getElementById('scanUserHint');
-        const areaEl = document.getElementById('scanFridgeArea');
-        const fridge_area = areaEl ? areaEl.value : '冷藏区';
-        btn.disabled = true;
-        setScanUserHint(hintEl, SCAN_HINT_EMPTY);
-
-        try {
-          const resp = await fetch('/ingredients/scan', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              Accept: 'application/x-ndjson'
-            },
-            body: JSON.stringify({ fridge_area })
-          });
-
-          if (!resp.ok) {
-            let errText = 'HTTP ' + resp.status;
-            try {
-              const t = await resp.text();
-              try {
-                const j = JSON.parse(t);
-                errText = j.error || t || errText;
-              } catch (e2) {
-                errText = t || errText;
-              }
-            } catch (e3) { /* ignore */ }
-            showToast(errText);
-            setScanUserHint(hintEl, '操作失败：' + errText);
-            return;
-          }
-
-          const reader = resp.body && resp.body.getReader ? resp.body.getReader() : null;
-          if (!reader) {
-            showToast('浏览器不支持流式读取');
-            return;
-          }
-
-          const dec = new TextDecoder();
-          let buf = '';
-          let closedOk = false;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += dec.decode(value, { stream: true });
-            let nl;
-            while ((nl = buf.indexOf('\n')) >= 0) {
-              const line = buf.slice(0, nl).trim();
-              buf = buf.slice(nl + 1);
-              if (!line) continue;
-              let j;
-              try {
-                j = JSON.parse(line);
-              } catch (e2) {
-                continue;
-              }
-              updateScanHintFromPayload(hintEl, j);
-
-              if (j.step === 'error') {
-                showToast(j.error || '采集失败');
-                setScanUserHint(hintEl, '未完成：' + (j.error || '失败'));
-                return;
-              }
-              if (j.step === 'done') {
-                closedOk = true;
-                const ing = j.ingredient;
-                showToast('已添加：' + (ing && ing.name ? ing.name + ' ' + (ing.quantity || '') + (ing.unit || '') : '完成'));
-                document.body.removeChild(modal);
-                setTimeout(loadInventory, 300);
-                return;
-              }
-            }
-          }
-
-          if (!closedOk) {
-            showToast('连接中断，请重试');
-            setScanUserHint(hintEl, '未正常结束，请重试。');
-          }
-        } catch (error) {
-          console.error('识别称重添加错误:', error);
-          showToast('请求失败：' + (error && error.message ? error.message : String(error)));
-          setScanUserHint(hintEl, '请求异常：' + (error && error.message ? error.message : String(error)));
-        } finally {
-          btn.disabled = false;
-        }
-      });
-
       // 保质期切换按钮
       document.getElementById('modalExpiryToggle').addEventListener('click', function() {
         const options = document.getElementById('modalExpiryOptions');
@@ -890,19 +1148,25 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       }
 
+      // 根据种类设置背景色 - 更新颜色对应
       let categoryColor = '';
+      let bgColor = '';
       switch (item.category) {
         case '果蔬类':
-          categoryColor = '#2ecc71';
+          categoryColor = '#2ecc71'; // 绿色
+          bgColor = 'rgba(46, 204, 113, 0.12)';
           break;
         case '肉蛋类':
-          categoryColor = '#e74c3c';
+          categoryColor = '#e74c3c'; // 红色
+          bgColor = 'rgba(231, 76, 60, 0.12)';
           break;
         case '奶制品类':
-          categoryColor = '#f39c12';
+          categoryColor = '#f39c12'; // 橙色
+          bgColor = 'rgba(243, 156, 18, 0.12)';
           break;
-        default:
-          categoryColor = '#8A8AA3';
+        default: // 其他
+          categoryColor = 'var(--muted)';
+          bgColor = 'var(--panel)';
       }
 
       // 创建食材卡片
@@ -910,8 +1174,10 @@ document.addEventListener('DOMContentLoaded', () => {
       card.className = 'ingredient-card';
       card.dataset.id = item.id;
       card.style.cssText = `
-        border-radius: 12px;
+        background: ${bgColor};
+        border-radius: 8px;
         padding: 12px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08);
         display: flex;
         position: relative;
         overflow: hidden;
@@ -928,18 +1194,15 @@ document.addEventListener('DOMContentLoaded', () => {
       firstRow.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;';
 
       const nameSpan = document.createElement('span');
-      nameSpan.className = 'inv-card-title';
-      nameSpan.style.cssText = 'font-size: 16px;';
+      nameSpan.style.cssText = 'font-weight: 700; font-size: 16px;';
       nameSpan.textContent = item.name || '未命名';
 
       const quantitySpan = document.createElement('span');
-      quantitySpan.className = 'text-qty';
-      quantitySpan.style.cssText = 'margin-left: auto; margin-right: 12px;';
+      quantitySpan.style.cssText = 'font-size: 14px; color: var(--muted); margin-left: auto; margin-right: 12px;';
       quantitySpan.textContent = `${item.quantity || 0}${item.unit || '个'}`;
 
       const categorySpan = document.createElement('span');
-      categorySpan.className = 'ingredient-tag';
-      categorySpan.style.cssText = `background: ${categoryColor}18; color: ${categoryColor}; border: 1px solid ${categoryColor}35;`;
+      categorySpan.style.cssText = `font-size: 12px; background: ${categoryColor}15; color: ${categoryColor}; padding: 2px 6px; border-radius: 10px;`;
       categorySpan.textContent = item.category || '未分类';
 
       firstRow.appendChild(nameSpan);
@@ -1451,7 +1714,8 @@ async function fetchRecipesFromServer() {
 async function loadRecipes(forceRefresh = false) {
   if (!recipesContent) return;
   if (recipesCache && recipesCache.parsed && !forceRefresh) { renderRecipesFromCache(); return; }
-  recipesContent.innerHTML = '<div class="recipes-loading"><span class="spinner" aria-hidden="true"></span><span>正在获取菜谱…</span></div>';
+  if (refreshRecipesBtn) refreshRecipesBtn.classList.add('btn--spinning');
+  recipesContent.innerHTML = `<div style="padding:16px;color:var(--text-muted)">正在获取菜谱…</div>`;
   try {
     await fetchRecipesFromServer();
     renderRecipesFromCache();
@@ -1459,21 +1723,11 @@ async function loadRecipes(forceRefresh = false) {
     console.warn(e);
     recipesContent.innerText = '无法获取菜谱';
     showToast('获取菜谱失败');
+  } finally {
+    if (refreshRecipesBtn) refreshRecipesBtn.classList.remove('btn--spinning');
   }
 }
-if (refreshRecipesBtn) {
-  refreshRecipesBtn.addEventListener('click', async () => {
-    refreshRecipesBtn.classList.add('is-loading');
-    refreshRecipesBtn.disabled = true;
-    recipesCache = null;
-    try {
-      await loadRecipes(true);
-    } finally {
-      refreshRecipesBtn.classList.remove('is-loading');
-      refreshRecipesBtn.disabled = false;
-    }
-  });
-}
+if (refreshRecipesBtn) refreshRecipesBtn.addEventListener('click', () => { recipesCache = null; loadRecipes(true); });
 
 // Render recipes from cache into cards
 function renderRecipesFromCache() {
@@ -1505,27 +1759,25 @@ function renderRecipesFromCache() {
       }
 
       const ingredientChips = (ingredients || []).slice(0, 8)
-        .map(i => `<span class="recipe-ingredient-chip">${escapeHtml(String(i))}</span>`)
+        .map(i => `<span class="recipe-chip">${escapeHtml(String(i))}</span>`)
         .join('');
       const ingredientCount = (ingredients || []).length;
-      const meta = `<div style="display:flex;gap:8px;align-items:center;margin-top:8px"><div class="text-muted-ui">${ingredientCount} 种食材</div></div>`;
+      const meta = `<div class="recipe-card__meta"><span>${ingredientCount} 种食材</span></div>`;
 
-      return `<div class="recipe-card recipe-card--enter" data-idx="${idx}" style="animation-delay:${Math.min(idx * 55, 480)}ms">
-        <div class="thumb" style="font-size:28px">
-          ${title.charAt(0) || '菜'}
-        </div>
-        <div style="flex:1;min-width:0">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-            <div style="min-width:0">
-              <div class="title" style="font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${title}</div>
-              <div class="desc" style="font-size:13px;margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${desc}</div>
+      return `<div class="recipe-card" data-idx="${idx}">
+        <div class="recipe-card__thumb" aria-hidden="true">${title.charAt(0) || '菜'}</div>
+        <div class="recipe-card__body">
+          <div class="recipe-card__row">
+            <div class="recipe-card__titles">
+              <div class="recipe-card__title">${title}</div>
+              <div class="recipe-card__desc">${desc}</div>
             </div>
-            <div style="display:flex;flex-direction:column;gap:8px;align-items:flex-end">
-              <button class="btn start-cook" data-idx="${idx}" style="padding:6px 10px;font-size:14px">开始烹饪</button>
-              <button class="btn ghost view-detail" data-idx="${idx}" style="padding:6px 10px;font-size:13px">查看详情</button>
+            <div class="recipe-card__actions">
+              <button type="button" class="btn btn--primary start-cook" data-idx="${idx}">开始烹饪</button>
+              <button type="button" class="btn btn--quiet view-detail" data-idx="${idx}">查看详情</button>
             </div>
           </div>
-          <div style="margin-top:10px">${ingredientChips}</div>
+          <div class="recipe-card__chips">${ingredientChips}</div>
           ${meta}
         </div>
       </div>`;
@@ -1671,7 +1923,7 @@ async function fetchRecipeSteps(title, desc) {
     const resp = await fetch('/message', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: prompt, tts: false }),
+      body: JSON.stringify({ text: prompt }),
       signal: controller.signal
     });
     clearTimeout(timeout);
@@ -1806,7 +2058,7 @@ function renderCookingControls() {
   playBtn.innerText = '播放当前步骤';
   playBtn.onclick = async () => {
     try {
-      const resp = await fetch('/message', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: `请朗读以下烹饪步骤：${stepText}`, tts: true }) });
+      const resp = await fetch('/message', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: `请朗读以下烹饪步骤：${stepText}` }) });
       if (!resp.ok) showToast('播报请求失败');
       else {
         const j = await resp.json();
@@ -2114,12 +2366,9 @@ function showCookingFinished() {
 
   function getCurrentScrollable() {
     try {
-      const curView = document.querySelector('.view-stack .view.is-active')
-        || document.querySelector('.view.is-active')
-        || Array.from(document.querySelectorAll('.view')).find(v => {
-          const s = window.getComputedStyle(v);
-          return s.display !== 'none' && s.visibility !== 'hidden';
-        });
+      const curView = Array.from(document.querySelectorAll('.view')).find(v => {
+        const s = window.getComputedStyle(v); return s.display !== 'none';
+      });
       if (curView) {
         const candidate = curView.querySelector(".messages, .content, .scrollable-area, #assistant_view");
         if (candidate && candidate.scrollHeight > candidate.clientHeight) return candidate;
@@ -2136,7 +2385,7 @@ function showCookingFinished() {
       const headerH = header ? header.getBoundingClientRect().height : 0;
       const statusH = status ? status.getBoundingClientRect().height : 0;
       const availH = window.innerHeight - headerH - statusH - 28;
-      document.querySelectorAll('.view-stack .view .messages, .messages, .view-stack .view .content, .view .content').forEach(el => {
+      document.querySelectorAll('.view .messages, .messages, .view .content').forEach(el => {
         try { if (el && el instanceof HTMLElement) { el.style.maxHeight = (availH > 120 ? availH : 120) + 'px'; el.style.overflow = 'auto'; el.style.webkitOverflowScrolling = 'touch'; el.style.overscrollBehavior = 'contain'; } } catch(e){}
       });
     } catch (e) {}
@@ -2154,6 +2403,8 @@ function showCookingFinished() {
   }
   // Bind menu buttons safely
   menuButtons.forEach(btn => btn.addEventListener('click', () => { const v = btn.dataset.view; if (v) switchView(v); }));
+  initSettingsTabsAndHistory();
+  initVoiceAssistantModal();
   // initial loads (defensive)
   loadInventory();
   loadRecipes();

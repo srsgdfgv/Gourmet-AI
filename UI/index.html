@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>智能冰箱助手</title>
+  <link rel="stylesheet" href="common.css">
+  <style>
+    /* 额外确保主区域与滚动容器允许触摸平移 */
+    #mainArea, .view, .messages, .content, .scrollable-area {
+      touch-action: pan-y;
+      -webkit-overflow-scrolling: touch;
+      -ms-touch-action: pan-y;
+    }
+    /* 确保 mainArea 占满高度，便于作为回退滚动容器 */
+    html, body, #layout, #mainArea { height: 100%; }
+  </style>
+</head>
+<body>
+  <div class="layout" id="layout">
+    <aside class="sidebar" aria-hidden="false">
+      <div class="brand-area">
+        <div class="brand">冰</div>
+        <div class="brand-text">
+          <h2 class="brand-title">智能冰箱助手</h2>
+        </div>
+      </div>
+
+      <nav class="menu" role="navigation" aria-label="主菜单">
+        <button class="menu-item active" data-view="assistant"><div class="icon">💬</div><div class="text">对话</div></button>
+        <button class="menu-item" data-view="inventory"><div class="icon">🥬</div><div class="text">库存</div></button>
+        <button class="menu-item" data-view="recipes"><div class="icon">📖</div><div class="text">菜谱</div></button>
+        <button class="menu-item" data-view="cooking"><div class="icon">👨‍🍳</div><div class="text">烹饪</div></button>
+        <button class="menu-item" data-view="settings"><div class="icon">⚙️</div><div class="text">设置</div></button>
+      </nav>
+    </aside>
+
+    <main class="main" role="main" id="mainArea">
+        <header class="main-header">
+        <div class="main-title">
+          <h1 id="mainTitle">智能对话</h1>
+          <!-- 删除"说话 → 我识别并回复（可语音播报）" -->
+          <p id="mainSubtitle" class="sub"></p>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button type="button" class="btn ghost icon-btn" id="openVoiceModalBtn" title="手动点录/点停">
+            <span aria-hidden="true">🎙</span><span class="icon-btn__label">语音弹窗</span>
+          </button>
+          <button type="button" class="fullscreen-btn icon-btn" id="fullscreenBtn" title="全屏">
+            <span aria-hidden="true">⛶</span><span class="icon-btn__label">全屏</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- 助手页面 -->
+      <section id="assistant" class="view active">
+        <div id="assistant_view" class="messages" aria-live="polite" aria-atomic="false"></div>
+        <div class="statusBar" id="status">就绪 — 点击右下角麦克风开始</div>
+      </section>
+
+      <!-- 库存页面：新的设计 -->
+      <section id="inventory" class="view" style="display:none; padding:12px; overflow:auto;">
+        <div id="inventory_content" class="content">加载中…</div>
+      </section>
+
+      <!-- 菜谱页面：卡片布局 + 详情弹窗 -->
+      <section id="recipes" class="view" style="display:none; padding:12px; overflow:auto;">
+        <!-- 删除重复标题 <h2>推荐菜谱</h2> -->
+        <div id="recipes_toolbar" style="display:flex;justify-content:space-between;align-items:center;margin:12px 0 8px;flex-wrap:wrap;gap:10px">
+          <div class="toolbar-hint">基于冰箱现有食材生成建议。</div>
+          <button type="button" id="refreshRecipes" class="btn ghost icon-btn" title="刷新菜谱">
+            <span class="refresh-icon" aria-hidden="true">↻</span><span class="icon-btn__label">刷新</span>
+          </button>
+        </div>
+        <div id="recipes_content" class="content">加载中…</div>
+      </section>
+
+      <!-- 烹饪页面：步骤引导 -->
+      <section id="cooking" class="view" style="display:none; padding:12px; overflow:auto;">
+        <!-- 删除重复标题 <h2>开始烹饪</h2> -->
+        <div id="cooking_panel" class="content" style="padding:12px">
+          <div id="noRecipeMsg" style="color:var(--muted)">请选择一个菜谱开始烹饪（在"菜谱"页选择"开始烹饪"）。</div>
+          <div id="cooking_card" style="display:none">
+            <h3 id="cooking_title"></h3>
+            <div id="cooking_desc" style="color:var(--muted);margin-bottom:10px"></div>
+
+            <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">
+              <button id="voiceGuideBtn" class="btn">语音引导：播报当前步骤</button>
+              <!-- 删除"上一步"和"下一步"按钮 -->
+              <div style="margin-left:auto;color:var(--muted)">
+                <!-- 删除重复序列号 <span id="stepIndex">0/0</span> -->
+              </div>
+            </div>
+
+            <ol id="cooking_steps" style="padding-left:20px"></ol>
+          </div>
+        </div>
+      </section>
+
+      <!-- 设置页面 -->
+      <section id="settings" class="view" style="display:none; padding:12px; overflow:auto;">
+        <div id="settings_content">
+          <!-- 设置选项卡 -->
+          <div style="display:flex; gap:8px; margin-bottom:20px; border-bottom:1px solid rgba(0,0,0,0.08);">
+            <button class="settings-tab-btn active" data-tab="prefs">⚙️ 偏好设置</button>
+            <button class="settings-tab-btn" data-tab="history">📋 历史记录</button>
+            <button class="settings-tab-btn" data-tab="stats">📊 统计信息</button>
+          </div>
+
+          <!-- 偏好设置面板 -->
+          <div id="settings_prefs_panel" class="settings-panel">
+            <div style="margin-bottom:16px">
+              <label style="display:flex; align-items:center; gap:8px; margin-bottom:12px">
+                <input type="checkbox" id="ttsEnable" checked> 启用语音播报（服务器端TTS）
+              </label>
+              <div style="color:var(--muted); font-size:12px; margin-bottom:16px">
+                💡 注意：TTS在服务器端合成并播放（树莓派）。
+              </div>
+            </div>
+
+            <div style="border-top:1px solid rgba(0,0,0,0.08); padding-top:16px; margin-top:8px">
+              <div style="font-weight:700; margin-bottom:12px">🍽️ 饮食偏好</div>
+              <div id="prefs_list" style="margin-bottom:16px; max-height:300px; overflow:auto"></div>
+
+              <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center">
+                <select id="pref_type_select" style="padding:8px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.1)">
+                  <option value="饮食偏好">饮食偏好</option>
+                  <option value="口味">口味</option>
+                  <option value="禁忌">禁忌</option>
+                </select>
+                <input id="pref_value_input" placeholder="例如：不吃辣" style="flex:1; padding:8px 12px; border-radius:8px; border:1px solid rgba(0,0,0,0.1)" />
+                <button id="pref_add_btn" class="btn" style="padding:8px 16px">➕ 添加</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- 历史记录面板 -->
+          <div id="settings_history_panel" class="settings-panel" style="display:none">
+            <div style="display:flex; justify-content:flex-end; align-items:center; margin-bottom:16px; gap:8px">
+              <button id="refresh_history_btn" class="btn ghost" style="padding:6px 12px">🔄 刷新</button>
+              <button id="clear_history_btn" class="btn ghost" style="background:rgba(230,57,70,0.1); color:var(--danger); padding:6px 12px">
+                🗑️ 清空历史
+              </button>
+            </div>
+
+            <div id="history_list" style="max-height:500px; overflow:auto; display:flex; flex-direction:column; gap:8px">
+              <div style="text-align:center; color:var(--muted); padding:20px">加载中...</div>
+            </div>
+          </div>
+
+          <!-- 统计信息面板 -->
+          <div id="settings_stats_panel" class="settings-panel" style="display:none">
+            <div id="stats_content" style="display:grid; gap:16px">
+              <div style="text-align:center; color:var(--muted); padding:20px">加载中...</div>
+            </div>
+            <button id="refresh_stats_btn" class="btn ghost" style="margin-top:16px; width:100%">🔄 刷新统计</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 固定麦克风（作为浮窗） -->
+  <div id="mic" class="mic-btn off" role="button" aria-pressed="false" tabindex="0" title="点击开始/停止监听">录音</div>
+
+  <!-- mic 附带弹窗（当当前视图不是对话页时显示小气泡） -->
+  <div id="micBubble" class="mic-bubble" style="display:none" role="status" aria-live="polite"></div>
+
+  <!-- 菜谱详情弹窗 -->
+  <div id="recipeModalBack" class="modal-backdrop" style="display:none">
+    <div class="modal" role="dialog" aria-modal="true" style="width:520px;max-width:92vw">
+      <header>
+        <strong id="recipeModalTitle">菜谱</strong>
+        <button id="recipeModalClose" class="btn ghost">关闭</button>
+      </header>
+      <div class="content" id="recipeModalContent"></div>
+      <div class="controls">
+        <div id="recipeModalStatus">就绪</div>
+        <div>
+          <button id="startCookingBtn" class="btn">开始烹饪</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="modalBackdrop" class="modal-backdrop" style="display:none">
+    <div class="modal" role="dialog" aria-modal="true">
+      <header>
+        <strong id="modalTitle">语音助手</strong>
+        <button id="modalClose" class="btn ghost">关闭</button>
+      </header>
+      <div class="content" id="modalMessages"></div>
+      <div class="controls">
+        <div id="modalStatus">就绪</div>
+        <div>
+          <button id="modalListen" class="btn">开始录音</button>
+          <button id="modalToggleContinuous" class="btn ghost">持续：关</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

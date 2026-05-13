@@ -22,6 +22,22 @@ _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
+# 前端静态页所在目录（与仓库中「冰箱助手UI」一致；index 内引用同级的 common.css、app.js）
+_FRIDGE_UI_DIR = os.path.join(_PROJECT_ROOT, "冰箱助手UI")
+
+
+def _static_ui_dir() -> str:
+    """
+    index.html / common.css / app.js 所在目录。
+    - 优先：与 web.ui.py 同目录（板子 CRAIC 文件夹平铺上传时常用）。
+    - 否则：使用子目录「冰箱助手UI」（PC 上仓库原有结构）。
+    """
+    if os.path.isfile(os.path.join(_PROJECT_ROOT, "index.html")):
+        return _PROJECT_ROOT
+    if os.path.isfile(os.path.join(_FRIDGE_UI_DIR, "index.html")):
+        return _FRIDGE_UI_DIR
+    return _PROJECT_ROOT
+
 
 def _load_raspberry_pi_client():
     path = os.path.join(_PROJECT_ROOT, 'raspberry_pi_client.py')
@@ -65,8 +81,9 @@ manual_record_thread = None
 # favicon route: return local file if present, else inline svg
 @app.route('/favicon.ico')
 def favicon():
-    if os.path.exists('favicon.ico'):
-        return send_from_directory('.', 'favicon.ico')
+    fav = os.path.join(_PROJECT_ROOT, "favicon.ico")
+    if os.path.isfile(fav):
+        return send_from_directory(_PROJECT_ROOT, "favicon.ico")
     svg = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
       <rect fill='#2f8de6' width='64' height='64' rx='12'/>
       <text x='50%' y='50%' font-size='36' text-anchor='middle' fill='white' dy='12'>冰</text>
@@ -76,16 +93,21 @@ def favicon():
     return resp
 
 
-# Serve index
+# Serve index：同目录平铺优先，否则 冰箱助手UI/
 @app.route('/')
 def index():
-    return send_from_directory('.', 'index.html')
+    return send_from_directory(_static_ui_dir(), "index.html")
 
 
-# Static files
-@app.route('/<path:filename>')
-def serve_static(filename):
-    return send_from_directory('.', filename)
+# 与 index.html 中相对路径 href="common.css"、src="app.js" 对应
+@app.route("/common.css")
+def serve_fridge_common_css():
+    return send_from_directory(_static_ui_dir(), "common.css")
+
+
+@app.route("/app.js")
+def serve_fridge_app_js():
+    return send_from_directory(_static_ui_dir(), "app.js")
 
 
 # ---------------------
@@ -609,6 +631,13 @@ def api_history():
     except Exception as e:
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
+
+
+# Static files（必须注册在所有 API 路由之后，否则 /<path:filename> 会抢走 /ingredients 等路径并 404）
+@app.route('/<path:filename>')
+def serve_static(filename):
+    return send_from_directory(_PROJECT_ROOT, filename)
+
 
 import RPi.GPIO as GPIO
 
