@@ -6,6 +6,12 @@
 
 基于异构计算的多模态个性化膳食智能终端：语音对话 + 食材视觉识别 + Web UI。
 
+## 实物展示
+
+<p align="center">
+  <img src="实物.png" alt="知食分子硬件实物" width="80%">
+</p>
+
 ## 功能概览
 
 - **对话与库存**：DeepSeek 意图识别，增删改查冰箱食材（`smart_fridge.py`）
