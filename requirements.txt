@@ -1,0 +1,17 @@
+# CRAIC-code：当前仓库 Python 代码用到的 pip 包
+# 树莓派建议：python3 -m venv --system-site-packages .venv
+# GPIO：用 rpi-lgpio 替代已停更的 RPi.GPIO，代码里仍可「import RPi.GPIO as GPIO」。
+# 不要与旧包 RPi.GPIO、apt 的 python3-rpi.gpio 同时装（会抢同一个模块名）；先卸再装：
+#   pip uninstall -y RPi.GPIO rpi-gpio 2>/dev/null; sudo apt remove -y python3-rpi.gpio 2>/dev/null
+#
+# rpi-lgpio → 依赖用 C 写的 lgpio；在虚拟环境里 pip 安装时会本地编译并链接系统里的 liblgpio。
+# 须先在系统装好开发包（把头文件和 .so 提供给链接器），再在 venv 里 pip install，否则编译/导入会失败：
+#   sudo apt update && sudo apt install -y liblgpio-dev
+#   source .venv/bin/activate && pip install -r requirements.txt
+
+requests>=2.28.0
+numpy>=1.24.0
+flask>=3.0.0
+flask-cors>=4.0.0
+rpi-lgpio>=0.6
+pigpio>=1.78 

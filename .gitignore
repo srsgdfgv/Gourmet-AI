@@ -1,0 +1,20 @@
+# 本地私密配置（含 API Key / WiFi / 内网 IP）
+local_config.py
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# 本地数据与临时文件
+*.db
+*.sqlite3
+*.log
+.DS_Store
+Thumbs.db
